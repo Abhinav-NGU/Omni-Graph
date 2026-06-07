@@ -2,7 +2,8 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Response, status, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Response, status, HTTPException, BackgroundTasks, File, UploadFile
+from ingest_loaders import load_pdf, load_url
 from pydantic import BaseModel
 
 from core.db import db_manager
@@ -22,6 +23,7 @@ async def lifespan(app: FastAPI):
     try:
         await db_manager.connect_to_neo4j()
         await db_manager.connect_to_qdrant()
+        await db_manager.connect_to_redis()
         yield
     finally:
         logger.info("Shutting down Orchestration Service...")
@@ -81,6 +83,8 @@ class ChatResponse(BaseModel):
     reasoning: List[str]
     strategy: str
 
+class IngestUrlRequest(BaseModel):
+    url: str
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
@@ -135,6 +139,65 @@ async def ingest_endpoint(request: IngestRequest, background_tasks: BackgroundTa
         logger.error(f"Failed to queue ingestion task: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to queue the ingestion task.")
 
+@app.post(
+    "/ingest/pdf",
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Ingestion"],
+    summary="Upload a PDF file for background ingestion",
+)
+async def ingest_pdf_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only .pdf files are supported."
+        )
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        text = await load_pdf(file_bytes)
+        background_tasks.add_task(ingest_text, text=text)
+        return {
+            "message": f"PDF '{file.filename}' extracted and queued for ingestion.",
+            "characters_extracted": len(text),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"PDF ingestion failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(e)}")
+
+@app.post(
+    "/ingest/url",
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Ingestion"],
+    summary="Fetch a URL and queue its content for ingestion",
+)
+async def ingest_url_endpoint(
+    request: IngestUrlRequest,
+    background_tasks: BackgroundTasks,
+):
+    if not request.url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="URL must start with http:// or https://"
+        )
+    try:
+        text = await load_url(request.url)
+        background_tasks.add_task(ingest_text, text=text)
+        return {
+            "message": f"URL '{request.url}' fetched and queued for ingestion.",
+            "characters_extracted": len(text),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"URL ingestion failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"URL fetch failed: {str(e)}")
 
 @app.post(
     "/collections/clear",
@@ -168,6 +231,26 @@ async def clear_main_qdrant_collection():
     except Exception as e:
         logger.error(f"Failed to delete Qdrant collection '{collection_name}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to delete collection: {str(e)}")
+
+@app.post(
+    "/graph/clear",
+    status_code=status.HTTP_200_OK,
+    tags=["Admin"],
+    summary="[Admin] Clear all nodes and relationships from Neo4j",
+)
+async def clear_graph():
+    """Deletes all entities and relationships from Neo4j. Irreversible."""
+    try:
+        async def _delete_all(tx):
+            await tx.run("MATCH (n) DETACH DELETE n")
+
+        async with db_manager.neo4j_driver.session() as session:
+            await session.execute_write(_delete_all)
+            logger.warning("Neo4j graph cleared.")
+            return {"message": "All nodes and relationships deleted from Neo4j."}
+    except Exception as e:
+        logger.error(f"Failed to clear Neo4j: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to clear graph: {str(e)}")
 
 
 @app.post(
@@ -232,7 +315,7 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     summary="Clear a chat session's conversation history",
 )
 async def clear_chat_session(session_id: str):
-    clear_session(session_id)
+    await clear_session(session_id)          # ← await
     return {"message": f"Session '{session_id}' cleared."}
 
 
@@ -242,7 +325,7 @@ async def clear_chat_session(session_id: str):
     summary="Get the conversation history for a session",
 )
 async def get_chat_history(session_id: str):
-    history = get_history(session_id)
+    history = await get_history(session_id)  # ← await
     if not history:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
     return {"session_id": session_id, "history": history}

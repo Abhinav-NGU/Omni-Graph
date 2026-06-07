@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # Ollama Configuration
     OLLAMA_BASE_URL: str
 
+    # Redis Configuration
+    REDIS_URL: str = "redis://redis:6379"
+    
     # Jaeger Agent Configuration (for OpenTelemetry)
     JAEGER_AGENT_HOST: str = "jaeger"
     JAEGER_AGENT_PORT: int = 6831

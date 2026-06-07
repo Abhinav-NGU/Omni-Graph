@@ -13,3 +13,7 @@ tenacity
 httpx
 opentelemetry-api
 typing-extensions
+redis[asyncio]
+pypdf
+beautifulsoup4
+python-multipart

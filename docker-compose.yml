@@ -64,8 +64,7 @@ services:
     image: ollama/ollama
     container_name: ollama
     environment:
-      - OLLAMA_GPU_LAYERS=0
-      - CUDA_VISIBLE_DEVICES="" # Use all available GPUs
+      - OLLAMA_FLASH_ATTENTION=1    # speeds up inference on GPU
     deploy:
       resources:
         reservations:
@@ -119,8 +118,27 @@ services:
         condition: service_started
       jaeger:
         condition: service_started
+      redis:
+        condition: service_healthy
     networks:
       - omnigraph_net
+  
+  # Redis Service (Go/Redis)
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./docker/redis_data:/data
+    networks:
+      - omnigraph_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 #
 #  # MCP Tools Service (Go/Fiber)
 #  mcp-tools-service:

@@ -12,6 +12,7 @@ Replaces the linear Phase 2 query pipeline with a smart agent that:
 import logging
 import uuid
 from typing import List, Dict, Any, Optional, Literal
+import json
 
 from langchain_ollama.chat_models import ChatOllama
 from langchain_ollama.embeddings import OllamaEmbeddings
@@ -29,27 +30,39 @@ MIN_SCORE = 0.35
 MAX_GRAPH_RESULTS = 25
 MAX_RETRIES = 2
 
-# ── In-memory session store ───────────────────────────────────────────────────
-_sessions: Dict[str, List[Dict[str, str]]] = {}
+
+# ── Redis-backed session store ────────────────────────────────────────────────
+SESSION_TTL = 60 * 60 * 24  # 24 hours — sessions expire after a day of inactivity
+SESSION_PREFIX = "omnigraph:session:"
+
+
+def _session_key(session_id: str) -> str:
+    return f"{SESSION_PREFIX}{session_id}"
 
 
 def get_or_create_session(session_id: Optional[str]) -> str:
-    sid = session_id or str(uuid.uuid4())
-    if sid not in _sessions:
-        _sessions[sid] = []
-    return sid
+    return session_id or str(uuid.uuid4())
 
 
-def get_history(session_id: str) -> List[Dict[str, str]]:
-    return _sessions.get(session_id, [])
+async def get_history(session_id: str) -> List[Dict[str, str]]:
+    redis = db_manager.redis
+    raw = await redis.get(_session_key(session_id))
+    if not raw:
+        return []
+    return json.loads(raw)
 
 
-def append_to_history(session_id: str, role: str, content: str):
-    _sessions.setdefault(session_id, []).append({"role": role, "content": content})
+async def append_to_history(session_id: str, role: str, content: str):
+    redis = db_manager.redis
+    key = _session_key(session_id)
+    history = await get_history(session_id)
+    history.append({"role": role, "content": content})
+    await redis.set(key, json.dumps(history), ex=SESSION_TTL)
 
 
-def clear_session(session_id: str):
-    _sessions.pop(session_id, None)
+async def clear_session(session_id: str):
+    redis = db_manager.redis
+    await redis.delete(_session_key(session_id))
 
 
 # ── LangGraph state ───────────────────────────────────────────────────────────
@@ -385,7 +398,7 @@ _agent = build_agent()
 
 async def run_agent(question: str, session_id: Optional[str] = None) -> Dict[str, Any]:
     sid = get_or_create_session(session_id)
-    history = get_history(sid)
+    history = await get_history(sid)          # ← await
 
     initial_state: AgentState = {
         "question": question,
@@ -402,8 +415,8 @@ async def run_agent(question: str, session_id: Optional[str] = None) -> Dict[str
 
     final_state = await _agent.ainvoke(initial_state)
 
-    append_to_history(sid, "user", question)
-    append_to_history(sid, "assistant", final_state["answer"])
+    await append_to_history(sid, "user", question)           # ← await
+    await append_to_history(sid, "assistant", final_state["answer"])  # ← await
 
     return {
         "answer": final_state["answer"],
