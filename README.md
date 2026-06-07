@@ -86,6 +86,9 @@ OLLAMA_BASE_URL=http://ollama:11434
 
 JAEGER_AGENT_HOST=jaeger
 JAEGER_AGENT_PORT=6831
+
+# API Key (for authentication)
+API_KEY=your-secret-api-key-here
 ```
 
 ### 3. Build and Run
@@ -111,6 +114,44 @@ All services should be `running` or `healthy`.
 
 ---
 
+## Security — API Key Authentication
+
+**All data-modifying and data-accessing endpoints require API key authentication** for security purposes.
+
+### Protected Endpoints
+The following endpoints require the `X-API-Key` header:
+- `/ingest` — text ingestion
+- `/ingest/pdf` — PDF ingestion
+- `/ingest/url` — URL ingestion
+- `/query` — RAG queries
+- `/chat` — agentic chat
+- `/chat/{session_id}` — session management
+- `/chat/{session_id}/history` — conversation history
+- `/collections/clear` — Qdrant admin
+- `/graph/clear` — Neo4j admin
+
+### Public Endpoints
+These endpoints do NOT require authentication:
+- `GET /` — service info
+- `GET /health` — health check
+- `GET /docs` — Swagger docs
+
+### How to Provide the API Key
+Include the API key in every protected request via the **`X-API-Key`** header:
+
+```bash
+curl -X POST http://localhost:8000/ingest \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key-here" \
+  -d '{"text": "Your text here"}'
+```
+
+### Error Responses
+- **401 Unauthorized** — missing `X-API-Key` header
+- **403 Forbidden** — invalid or incorrect API key
+
+---
+
 ## Service URLs
 
 | Service | URL | Description |
@@ -127,10 +168,13 @@ All services should be `running` or `healthy`.
 
 ## Usage Examples
 
+> **Note:** All examples below include the required `X-API-Key` header. Replace `your-secret-api-key-here` with the value from your `.env` file.
+
 ### Ingest a document
 ```bash
 curl -X POST http://localhost:8000/ingest \
 -H "Content-Type: application/json" \
+-H "X-API-Key: your-secret-api-key-here" \
 -d '{"text": "Elon Musk founded SpaceX in 2002 and Tesla in 2003."}'
 ```
 
@@ -138,6 +182,7 @@ curl -X POST http://localhost:8000/ingest \
 ```bash
 curl -X POST http://localhost:8000/query \
 -H "Content-Type: application/json" \
+-H "X-API-Key: your-secret-api-key-here" \
 -d '{"question": "Who founded SpaceX?"}'
 ```
 
@@ -146,11 +191,13 @@ curl -X POST http://localhost:8000/query \
 # First message — no session_id needed
 curl -X POST http://localhost:8000/chat \
 -H "Content-Type: application/json" \
+-H "X-API-Key: your-secret-api-key-here" \
 -d '{"question": "Who founded SpaceX?"}'
 
 # Follow-up — use the session_id from the response above
 curl -X POST http://localhost:8000/chat \
 -H "Content-Type: application/json" \
+-H "X-API-Key: your-secret-api-key-here" \
 -d '{"question": "What else did he found?", "session_id": "your-session-id"}'
 ```
 

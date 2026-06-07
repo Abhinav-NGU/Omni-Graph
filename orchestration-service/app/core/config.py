@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     JAEGER_AGENT_HOST: str = "jaeger"
     JAEGER_AGENT_PORT: int = 6831
 
+    # API Key
+    API_KEY: str = "changeme"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 settings = Settings()

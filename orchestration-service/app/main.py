@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Response, status, HTTPException, BackgroundTasks, File, UploadFile
+from fastapi import FastAPI, Response, status, HTTPException, BackgroundTasks, File, UploadFile, Depends
 from ingest_loaders import load_pdf, load_url
 from pydantic import BaseModel
 
@@ -11,6 +11,8 @@ from core.utils import check_ollama_models
 from ingestion import ingest_text, QDRANT_COLLECTION_NAME
 from query import run_query_pipeline
 from agent import run_agent, clear_session, get_history
+
+from auth import require_api_key
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -130,6 +132,7 @@ async def health_check(response: Response) -> HealthCheckResponse:
     status_code=status.HTTP_202_ACCEPTED,
     tags=["Ingestion"],
     summary="Queue raw text for background ingestion into Qdrant + Neo4j",
+    dependencies=[Depends(require_api_key)],
 )
 async def ingest_endpoint(request: IngestRequest, background_tasks: BackgroundTasks):
     try:
@@ -143,6 +146,7 @@ async def ingest_endpoint(request: IngestRequest, background_tasks: BackgroundTa
     "/ingest/pdf",
     status_code=status.HTTP_202_ACCEPTED,
     tags=["Ingestion"],
+    dependencies=[Depends(require_api_key)],
     summary="Upload a PDF file for background ingestion",
 )
 async def ingest_pdf_endpoint(
@@ -175,6 +179,7 @@ async def ingest_pdf_endpoint(
     "/ingest/url",
     status_code=status.HTTP_202_ACCEPTED,
     tags=["Ingestion"],
+    dependencies=[Depends(require_api_key)],
     summary="Fetch a URL and queue its content for ingestion",
 )
 async def ingest_url_endpoint(
@@ -203,6 +208,7 @@ async def ingest_url_endpoint(
     "/collections/clear",
     status_code=status.HTTP_200_OK,
     tags=["Admin"],
+    dependencies=[Depends(require_api_key)],
     summary="[Admin] Clear the main Qdrant collection",
 )
 async def clear_main_qdrant_collection():
@@ -236,6 +242,7 @@ async def clear_main_qdrant_collection():
     "/graph/clear",
     status_code=status.HTTP_200_OK,
     tags=["Admin"],
+    dependencies=[Depends(require_api_key)],
     summary="[Admin] Clear all nodes and relationships from Neo4j",
 )
 async def clear_graph():
@@ -257,6 +264,7 @@ async def clear_graph():
     "/query",
     tags=["Query"],
     response_model=QueryResponse,
+    dependencies=[Depends(require_api_key)],
     summary="Simple RAG query — vector + graph + LLM (no agent, no history)",
 )
 async def query_endpoint(request: QueryRequest) -> QueryResponse:
@@ -280,6 +288,7 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
     "/chat",
     tags=["Agent"],
     response_model=ChatResponse,
+    dependencies=[Depends(require_api_key)],
     summary="Agentic chat — smart routing, retry logic, and conversation memory",
 )
 async def chat_endpoint(request: ChatRequest) -> ChatResponse:
@@ -312,6 +321,7 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
 @app.delete(
     "/chat/{session_id}",
     tags=["Agent"],
+    dependencies=[Depends(require_api_key)],
     summary="Clear a chat session's conversation history",
 )
 async def clear_chat_session(session_id: str):
@@ -322,6 +332,7 @@ async def clear_chat_session(session_id: str):
 @app.get(
     "/chat/{session_id}/history",
     tags=["Agent"],
+    dependencies=[Depends(require_api_key)],
     summary="Get the conversation history for a session",
 )
 async def get_chat_history(session_id: str):
