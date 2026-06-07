@@ -49,6 +49,7 @@ Thumbs.db
 docker/neo4j_data/
 docker/ollama_data/
 docker/qdrant_data/
+docker/redis_data/
 
 # Database locks and system files
 *.lock

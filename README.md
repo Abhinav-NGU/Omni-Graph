@@ -130,28 +130,28 @@ All services should be `running` or `healthy`.
 ### Ingest a document
 ```bash
 curl -X POST http://localhost:8000/ingest \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Elon Musk founded SpaceX in 2002 and Tesla in 2003."}'
+-H "Content-Type: application/json" \
+-d '{"text": "Elon Musk founded SpaceX in 2002 and Tesla in 2003."}'
 ```
 
 ### Simple query (Phase 2)
 ```bash
 curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Who founded SpaceX?"}'
+-H "Content-Type: application/json" \
+-d '{"question": "Who founded SpaceX?"}'
 ```
 
 ### Agentic chat (Phase 3)
 ```bash
 # First message — no session_id needed
 curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Who founded SpaceX?"}'
+-H "Content-Type: application/json" \
+-d '{"question": "Who founded SpaceX?"}'
 
 # Follow-up — use the session_id from the response above
 curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What else did he found?", "session_id": "your-session-id"}'
+-H "Content-Type: application/json" \
+-d '{"question": "What else did he found?", "session_id": "your-session-id"}'
 ```
 
 ### Verify Neo4j graph data
