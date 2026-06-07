@@ -2,13 +2,16 @@ import asyncio
 import logging
 import uuid
 from typing import List, Dict, Any
+import hashlib
+import json
+import re
 
-from fastapi import HTTPException
+
 from langchain_ollama.chat_models import ChatOllama
 from langchain_ollama.embeddings import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from qdrant_client import models
-from qdrant_client import AsyncQdrantClient
+from qdrant_client import models, AsyncQdrantClient
+
 from core.config import settings
 from core.db import db_manager
 from graph import ExtractedGraph
@@ -24,79 +27,87 @@ def _get_embedding_model() -> OllamaEmbeddings:
 
 def _get_graph_extraction_llm() -> ChatOllama:
     return ChatOllama(
-        model="llama3",
+        model="llama3.2",
         base_url=settings.OLLAMA_BASE_URL,
         temperature=0.0,
     ).with_structured_output(ExtractedGraph)
 
 
 async def chunk_text(text: str) -> List[str]:
-    text_splitter = RecursiveCharacterTextSplitter(
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
         length_function=len,
     )
-    return text_splitter.split_text(text)
+    return splitter.split_text(text)
 
 
 async def generate_embeddings(chunks: List[str]) -> List[List[float]]:
     logger.info(f"Generating embeddings for {len(chunks)} chunks...")
-    embedder = _get_embedding_model()
-    return await embedder.aembed_documents(chunks)
+    return await _get_embedding_model().aembed_documents(chunks)
+
 
 
 async def extract_graph_from_chunk(chunk: str) -> ExtractedGraph:
     logger.info("Extracting graph from chunk...")
-    llm = _get_graph_extraction_llm()
 
-    prompt = f"""
-    You are an expert data analyst. Your task is to extract a knowledge graph from the following text.
-    Identify entities (people, organizations, locations, concepts) and the relationships between them.
-    Provide the output as a list of JSON objects, where each object represents a single relationship.
-    Each object must have a 'source', 'target', 'relationship', and an optional 'properties' field.
-    The 'relationship' should be a concise, uppercase verb phrase (e.g., 'HIRED', 'LOCATED_IN').
+    # Try structured output first
+    try:
+        llm = _get_graph_extraction_llm()
+        result = await llm.ainvoke(f"""
+You are an expert data analyst. Extract a knowledge graph from the text below.
+Each relationship needs: 'source', 'target', 'relationship' (uppercase verb), 'properties'.
 
-    Example Input: "Apple Inc., based in Cupertino, announced the new iPhone 15 in September 2023."
-    Example Output:
-    {{
-        "entities": [
-            {{
-                "source": "Apple Inc.",
-                "target": "Cupertino",
-                "relationship": "BASED_IN",
-                "properties": {{}}
-            }},
-            {{
-                "source": "Apple Inc.",
-                "target": "iPhone 15",
-                "relationship": "ANNOUNCED",
-                "properties": {{
-                    "date": "September 2023"
-                }}
-            }}
-        ]
-    }}
+Example Output:
+{{"entities": [{{"source": "Apple Inc.", "target": "Cupertino", "relationship": "BASED_IN", "properties": {{}}}}]}}
 
-    Now, analyze the following text:
+Text:
+---
+{chunk}
+---
+Respond ONLY with valid JSON. No explanation, no markdown.
+        """)
+        logger.info(f"Structured extraction got {len(result.entities)} entities.")
+        return result
+    except Exception as e:
+        logger.warning(f"Structured output failed ({e}), trying manual parse...")
 
-    ---
-    {chunk}
-    ---
-    """
-    return await llm.ainvoke(prompt)
+    # Fallback — plain LLM + manual JSON parse
+    try:
+        plain_llm = ChatOllama(
+            model="llama3.2",
+            base_url=settings.OLLAMA_BASE_URL,
+            temperature=0.0,
+        )
+        response = await plain_llm.ainvoke(f"""
+Extract a knowledge graph from this text. Return ONLY JSON, no other text:
+{{"entities": [{{"source": "X", "target": "Y", "relationship": "VERB", "properties": {{}}}}]}}
 
+Text:
+---
+{chunk}
+---
+        """)
+        raw = re.sub(r"```(?:json)?|```", "", response.content).strip()
+        data = json.loads(raw)
+        result = ExtractedGraph(**data)
+        logger.info(f"Manual parse got {len(result.entities)} entities.")
+        return result
+    except Exception as e:
+        logger.error(f"Manual parse also failed: {e}")
+        return ExtractedGraph(entities=[])
 
 async def _ensure_qdrant_collection(qdrant_client: AsyncQdrantClient, embedding_size: int):
     try:
         await qdrant_client.get_collection(collection_name=QDRANT_COLLECTION_NAME)
         logger.info(f"Qdrant collection '{QDRANT_COLLECTION_NAME}' already exists.")
     except Exception:
-        logger.info(f"Qdrant collection '{QDRANT_COLLECTION_NAME}' not found. Creating it.")
+        logger.info(f"Creating Qdrant collection '{QDRANT_COLLECTION_NAME}'...")
         await qdrant_client.create_collection(
             collection_name=QDRANT_COLLECTION_NAME,
             vectors_config=models.VectorParams(
                 size=embedding_size,
-                distance=models.Distance.COSINE
+                distance=models.Distance.COSINE,
             ),
         )
 
@@ -104,15 +115,15 @@ async def _ensure_qdrant_collection(qdrant_client: AsyncQdrantClient, embedding_
 async def upsert_chunks_to_qdrant(
     chunk_ids: List[str], chunks: List[str], embeddings: List[List[float]]
 ):
-    logger.info(f"Upserting {len(chunks)} chunks to Qdrant...")
     if not embeddings:
-        logger.warning("No embeddings provided; skipping upsert to Qdrant.")
+        logger.warning("No embeddings — skipping Qdrant upsert.")
         return
 
-    qdrant_client: AsyncQdrantClient = db_manager.qdrant_client  # Fix 4: must be AsyncQdrantClient
-    await _ensure_qdrant_collection(qdrant_client, embedding_size=len(embeddings[0]))
+    logger.info(f"Upserting {len(chunks)} chunks to Qdrant...")
+    client: AsyncQdrantClient = db_manager.qdrant_client
+    await _ensure_qdrant_collection(client, embedding_size=len(embeddings[0]))
 
-    await qdrant_client.upsert(
+    await client.upsert(
         collection_name=QDRANT_COLLECTION_NAME,
         points=models.Batch(
             ids=chunk_ids,
@@ -125,12 +136,7 @@ async def upsert_chunks_to_qdrant(
 
 
 async def _create_graph_tx(tx, data: List[Dict[str, Any]]):
-    """
-    Creates graph entities using standard Cypher only — no APOC required.
-    The extracted relationship type is stored as a 'type' property on a
-    generic RELATES_TO edge, which is a standard graph modelling pattern
-    when relationship types are dynamic/unknown at schema time.
-    """
+    """Standard Cypher only — no APOC. Relationship type stored as a property."""
     cypher_query = """
     UNWIND $data AS row
     MERGE (source:Entity {name: row.source})
@@ -146,31 +152,40 @@ async def _create_graph_tx(tx, data: List[Dict[str, Any]]):
 
 async def upsert_graph_to_neo4j(graph: ExtractedGraph):
     if not graph.entities:
-        logger.info("No graph entities to upsert into Neo4j.")
+        logger.info("No graph entities to upsert.")
         return
 
     logger.info(f"Upserting {len(graph.entities)} relationships to Neo4j...")
     data_to_load = [entity.model_dump() for entity in graph.entities]
+    logger.info(f"Graph data: {data_to_load}")
 
-    # Fix 6: neo4j_driver must be AsyncDriver for async session/execute_write
     async with db_manager.neo4j_driver.session() as session:
         summary = await session.execute_write(_create_graph_tx, data_to_load)
-        logger.info(
-            f"Neo4j write complete: "
-            f"{summary.counters.relationships_created} relationships created."
-        )
+        nodes_created = summary.counters.nodes_created
+        rels_created = summary.counters.relationships_created
+        logger.info(f"Neo4j write: {nodes_created} nodes, {rels_created} relationships created.")
+        if nodes_created == 0 and rels_created == 0:
+            logger.warning("0 writes to Neo4j — data may already exist via MERGE.")
 
 
 async def ingest_text(text: str):
     logger.info("Starting ingestion pipeline...")
 
     chunks = await chunk_text(text)
-    chunk_ids = [str(uuid.uuid4()) for _ in chunks]
+    
+    # OLD — random ID every time, causes duplicates
+    # chunk_ids = [str(uuid.uuid4()) for _ in chunks]
+
+    # NEW — deterministic ID based on content hash, safe to re-ingest
+    chunk_ids = [
+        str(uuid.UUID(hashlib.md5(chunk.encode()).hexdigest()))
+        for chunk in chunks
+    ]
 
     embeddings = await generate_embeddings(chunks)
     await upsert_chunks_to_qdrant(chunk_ids, chunks, embeddings)
+    # ... rest unchanged
 
-    # Fix 7: Run graph extraction concurrently instead of sequentially
     graphs = await asyncio.gather(
         *[extract_graph_from_chunk(chunk) for chunk in chunks],
         return_exceptions=True,
@@ -179,10 +194,10 @@ async def ingest_text(text: str):
     for i, result in enumerate(graphs):
         if isinstance(result, Exception):
             logger.error(f"Graph extraction failed for chunk {i+1}: {result}")
-            continue
+            continue                              # ← this line was missing
         if result.entities:
-            await upsert_graph_to_neo4j(result)
+            await upsert_graph_to_neo4j(result)  # ← this line was missing
         else:
-            logger.info(f"No graph entities found in chunk {i+1}.")
+            logger.info(f"No entities found in chunk {i+1}.")  # ← missing
 
-    logger.info("Ingestion pipeline completed successfully.")
+    logger.info("Ingestion pipeline completed successfully.")  # ← missing

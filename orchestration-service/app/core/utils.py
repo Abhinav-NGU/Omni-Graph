@@ -8,7 +8,7 @@ async def check_ollama_models():
     """
     Checks if the required Ollama models are available and logs a warning if not.
     """
-    required_models = {"nomic-embed-text", "llama3"}
+    required_models = {"nomic-embed-text", "llama3.2"}
     logger.info("Checking for required Ollama models...")
 
     try:

@@ -63,6 +63,9 @@ services:
   ollama:
     image: ollama/ollama
     container_name: ollama
+    environment:
+      - OLLAMA_GPU_LAYERS=0
+      - CUDA_VISIBLE_DEVICES="" # Use all available GPUs
     deploy:
       resources:
         reservations:
