@@ -48,13 +48,12 @@ async def vector_search(query_vector: List[float]) -> List[Dict[str, Any]]:
         response = await client.query_points(
             collection_name=QDRANT_COLLECTION_NAME,
             query=query_vector,
-            limit=TOP_K_CHUNKS,
+            limit=top_k,
             with_payload=True,
-            score_threshold=MIN_SCORE,  # ← add this line
         )
         results = response.points
     except Exception as e:
-        logger.error(f"Qdrant query failed: {e}", exc_info=True)
+        logger.error(f"Qdrant search failed: {e}", exc_info=True)
         return []
 
     chunks = []
@@ -72,38 +71,72 @@ async def vector_search(query_vector: List[float]) -> List[Dict[str, Any]]:
 
 # ── Step 3: graph context ─────────────────────────────────────────────────────
 
-async def _fetch_graph_tx(tx, entity_names: List[str]) -> List[Dict[str, Any]]:
-    """
-    Explicit 1-hop and 2-hop OPTIONAL MATCH — avoids the parameterised
-    *1..$hops pattern which Neo4j does not support at runtime.
-    """
-    cypher = """
+async def _fetch_graph_tx(tx, entity_names: List[str]) -> List[str]:
+    one_hop = """
     UNWIND $names AS name
-    MATCH (e:Entity)
+    MATCH (e:Entity)-[r:RELATES_TO]->(n:Entity)
     WHERE toLower(e.name) CONTAINS toLower(name)
-
-    OPTIONAL MATCH (e)-[r1:RELATES_TO]->(n1:Entity)
-    OPTIONAL MATCH (e)-[r1b:RELATES_TO]->(mid:Entity)-[r2:RELATES_TO]->(n2:Entity)
-
-    WITH e,
-        collect(DISTINCT {
-            node_names: [e.name, n1.name],
-            rel_types:  [r1.type]
-        }) AS one_hop,
-        collect(DISTINCT {
-            node_names: [e.name, mid.name, n2.name],
-            rel_types:  [r1b.type, r2.type]
-        }) AS two_hop
-
-    UNWIND (one_hop + two_hop) AS path
-    WHERE ALL(n IN path.node_names WHERE n IS NOT NULL)
-      AND ALL(r IN path.rel_types  WHERE r IS NOT NULL)
-
-    RETURN DISTINCT path.node_names AS node_names, path.rel_types AS rel_types
+      AND r.type IS NOT NULL
+    RETURN e.name AS src, r.type AS rel, n.name AS tgt
     LIMIT $limit
     """
-    result = await tx.run(cypher, names=entity_names, limit=MAX_GRAPH_RESULTS)
-    return await result.data()
+
+    two_hop = """
+    UNWIND $names AS name
+    MATCH (e:Entity)-[r1:RELATES_TO]->(mid:Entity)-[r2:RELATES_TO]->(n:Entity)
+    WHERE toLower(e.name) CONTAINS toLower(name)
+      AND r1.type IS NOT NULL AND r2.type IS NOT NULL
+    RETURN e.name AS src, r1.type AS rel1, mid.name AS mid, r2.type AS rel2, n.name AS tgt
+    LIMIT $limit
+    """
+
+    lines = []
+
+    r1 = await tx.run(one_hop, names=entity_names, limit=MAX_GRAPH_RESULTS)
+    for rec in await r1.data():
+        lines.append(f"{rec['src']} --[{rec['rel']}]--> {rec['tgt']}")
+
+    r2 = await tx.run(two_hop, names=entity_names, limit=MAX_GRAPH_RESULTS)
+    for rec in await r2.data():
+        lines.append(
+            f"{rec['src']} --[{rec['rel1']}]--> {rec['mid']} --[{rec['rel2']}]--> {rec['tgt']}"
+        )
+
+    return list(dict.fromkeys(lines))  # deduplicate
+
+
+async def graph_context(chunks: List[Dict[str, Any]]) -> str:
+    if not chunks:
+        return ""
+
+    entity_names: List[str] = []
+    for chunk in chunks:
+        for token in chunk["text"].split():
+            cleaned = token.strip(".,;:\"'()[]")
+            if cleaned and cleaned[0].isupper() and len(cleaned) > 2:
+                entity_names.append(cleaned)
+
+    entity_names = list(dict.fromkeys(entity_names))[:30]
+
+    if not entity_names:
+        logger.info("No candidate entities found; skipping graph query.")
+        return ""
+
+    logger.info(f"Querying Neo4j for {len(entity_names)} candidate entities...")
+
+    try:
+        async with db_manager.neo4j_driver.session() as session:
+            lines = await session.execute_read(_fetch_graph_tx, entity_names)
+    except Exception as e:
+        logger.error(f"Neo4j graph query failed: {e}", exc_info=True)
+        return ""
+
+    if not lines:
+        logger.info("No graph paths found in Neo4j.")
+        return ""
+
+    logger.info(f"Graph context: {len(lines)} paths found.")
+    return "\n".join(lines)
 
 
 async def graph_context(chunks: List[Dict[str, Any]]) -> str:

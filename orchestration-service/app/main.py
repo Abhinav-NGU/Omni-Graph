@@ -1,14 +1,15 @@
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, Response, status, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 from core.db import db_manager
 from core.utils import check_ollama_models
-from ingestion import ingest_text
+from ingestion import ingest_text, QDRANT_COLLECTION_NAME
 from query import run_query_pipeline
+from agent import run_agent, clear_session, get_history
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="OmniGraph Orchestration Service",
     description="Orchestrates agentic workflows and manages the knowledge graph.",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
     root_path="/orchestration",
 )
@@ -67,11 +68,25 @@ class QueryResponse(BaseModel):
     graph_context: str
 
 
+class ChatRequest(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    session_id: str
+    sources: List[SourceChunk]
+    graph_context: str
+    reasoning: List[str]
+    strategy: str
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["General"])
 def read_root():
-    return {"message": "Hello from OmniGraph Orchestration Service"}
+    return {"message": "Hello from OmniGraph Orchestration Service v0.3.0"}
 
 
 @app.get(
@@ -84,7 +99,6 @@ async def health_check(response: Response) -> HealthCheckResponse:
     is_healthy = True
     statuses: Dict[str, HealthStatus] = {}
 
-    # Neo4j
     try:
         await db_manager.neo4j_driver.verify_connectivity()
         statuses["neo4j"] = HealthStatus(status="healthy")
@@ -93,7 +107,6 @@ async def health_check(response: Response) -> HealthCheckResponse:
         statuses["neo4j"] = HealthStatus(status="unhealthy")
         logger.error(f"Neo4j health check failed: {e}")
 
-    # Qdrant — use get_collections(), not the non-existent .rest.get("/")
     try:
         await db_manager.qdrant_client.get_collections()
         statuses["qdrant"] = HealthStatus(status="healthy")
@@ -121,37 +134,50 @@ async def ingest_endpoint(request: IngestRequest, background_tasks: BackgroundTa
     except Exception as e:
         logger.error(f"Failed to queue ingestion task: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to queue the ingestion task.")
-    
-@app.post("/debug/ingest", tags=["Debug"])
-async def debug_ingest(request: IngestRequest):
+
+
+@app.post(
+    "/collections/clear",
+    status_code=status.HTTP_200_OK,
+    tags=["Admin"],
+    summary="[Admin] Clear the main Qdrant collection",
+)
+async def clear_main_qdrant_collection():
     """
-    Synchronous ingest — runs in foreground so errors are visible.
-    Use this to diagnose why /ingest is not writing to Neo4j.
+    Deletes all vectors and metadata from the main `omnigraph_chunks` collection.
+    This is a destructive operation.
+
+    The collection will be recreated automatically on the next ingestion.
     """
-    from ingestion import ingest_text
+    client = db_manager.qdrant_client
+    if not client:
+        raise HTTPException(status_code=503, detail="Qdrant client is not available.")
+
+    collection_name = QDRANT_COLLECTION_NAME
     try:
-        await ingest_text(text=request.text)
-        return {"message": "Ingest completed successfully."}
+        logger.warning(f"Received request to delete Qdrant collection: '{collection_name}'")
+        result = await client.delete_collection(collection_name=collection_name)
+
+        if result:
+            logger.info(f"Successfully deleted Qdrant collection '{collection_name}'.")
+            return {"message": f"Collection '{collection_name}' was deleted successfully."}
+        else:
+            logger.warning(f"Attempted to delete collection '{collection_name}', but it did not exist.")
+            return {"message": f"Collection '{collection_name}' did not exist or was already deleted."}
+
     except Exception as e:
-        logger.error(f"Debug ingest failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to delete Qdrant collection '{collection_name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to delete collection: {str(e)}")
 
 
 @app.post(
     "/query",
     tags=["Query"],
     response_model=QueryResponse,
-    summary="Ask a question — answered using vector search + graph context + LLM",
+    summary="Simple RAG query — vector + graph + LLM (no agent, no history)",
 )
 async def query_endpoint(request: QueryRequest) -> QueryResponse:
-    """
-    Full RAG + Graph pipeline:
-
-    1. Embed the question (nomic-embed-text)
-    2. Semantic vector search → top relevant chunks (Qdrant)
-    3. Knowledge-graph context → entity relationships (Neo4j)
-    4. LLM synthesis → grounded answer (llama3)
-    """
+    """Phase 2 endpoint — kept for backwards compatibility."""
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question must not be empty.")
 
@@ -165,3 +191,58 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
     except Exception as e:
         logger.error(f"Query pipeline failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Query pipeline error: {str(e)}")
+
+
+@app.post(
+    "/chat",
+    tags=["Agent"],
+    response_model=ChatResponse,
+    summary="Agentic chat — smart routing, retry logic, and conversation memory",
+)
+async def chat_endpoint(request: ChatRequest) -> ChatResponse:
+    """
+    Phase 3 LangGraph agent.
+    Omit session_id to start a new session — the ID is returned in the response.
+    Pass the same session_id on follow-up questions for multi-turn memory.
+    """
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question must not be empty.")
+
+    try:
+        result = await run_agent(
+            question=request.question,
+            session_id=request.session_id,
+        )
+        return ChatResponse(
+            answer=result["answer"],
+            session_id=result["session_id"],
+            sources=[SourceChunk(**s) for s in result["sources"]],
+            graph_context=result["graph_context"],
+            reasoning=result["reasoning"],
+            strategy=result["strategy"],
+        )
+    except Exception as e:
+        logger.error(f"Agent failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+
+
+@app.delete(
+    "/chat/{session_id}",
+    tags=["Agent"],
+    summary="Clear a chat session's conversation history",
+)
+async def clear_chat_session(session_id: str):
+    clear_session(session_id)
+    return {"message": f"Session '{session_id}' cleared."}
+
+
+@app.get(
+    "/chat/{session_id}/history",
+    tags=["Agent"],
+    summary="Get the conversation history for a session",
+)
+async def get_chat_history(session_id: str):
+    history = get_history(session_id)
+    if not history:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    return {"session_id": session_id, "history": history}
