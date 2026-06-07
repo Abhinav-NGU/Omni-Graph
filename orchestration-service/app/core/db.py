@@ -1,0 +1,58 @@
+import logging
+from typing import Optional
+
+from neo4j import AsyncGraphDatabase, AsyncDriver
+from qdrant_client import AsyncQdrantClient
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+from .config import settings
+
+logger = logging.getLogger(__name__)
+
+class DatabaseManager:
+    """
+    Manages connections to Neo4j and Qdrant databases.
+    Includes retry logic for initial connections and graceful shutdown handlers.
+    """
+    def __init__(self):
+        self.neo4j_driver: Optional[AsyncDriver] = None
+        self.qdrant_client: Optional[AsyncQdrantClient] = None
+
+    @retry(stop=stop_after_attempt(5), wait=wait_fixed(3), reraise=True)
+    async def connect_to_neo4j(self):
+        """Establishes a connection to the Neo4j database with retry logic."""
+        try:
+            logger.info("Attempting to connect to Neo4j...")
+            self.neo4j_driver = AsyncGraphDatabase.driver(
+                settings.NEO4J_URI,
+                auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD.get_secret_value())
+            )
+            await self.neo4j_driver.verify_connectivity()
+            logger.info("Successfully connected to Neo4j.")
+        except Exception as e:
+            logger.error(f"Failed to connect to Neo4j. Retrying... Error: {e}")
+            raise
+
+    @retry(stop=stop_after_attempt(5), wait=wait_fixed(3), reraise=True)
+    async def connect_to_qdrant(self):
+        """Establishes a connection to the Qdrant database with retry logic."""
+        try:
+            logger.info("Attempting to connect to Qdrant...")
+            self.qdrant_client = AsyncQdrantClient(url=settings.QDRANT_URL)
+            # Verify connectivity by fetching collections
+            await self.qdrant_client.get_collections()
+            logger.info("Successfully connected to Qdrant.")
+        except Exception as e:
+            logger.error(f"Failed to connect to Qdrant. Retrying... Error: {e}")
+            raise
+
+    async def close_connections(self):
+        """Closes all database connections."""
+        if self.neo4j_driver:
+            await self.neo4j_driver.close()
+            logger.info("Neo4j connection closed.")
+        if self.qdrant_client:
+            await self.qdrant_client.close()
+            logger.info("Qdrant connection closed.")
+
+db_manager = DatabaseManager()

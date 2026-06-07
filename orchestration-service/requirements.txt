@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+langgraph
+langchain
+neo4j
+qdrant-client
+opentelemetry-api
+pydantic-settings
+tenacity
+langchain-community
+langchain-text-splitters
+langchain-ollama
+httpx

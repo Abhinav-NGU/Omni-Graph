@@ -1,0 +1,133 @@
+networks:
+  omnigraph_net:
+    driver: bridge
+
+services:
+  # API Gateway: Traefik
+  # Handles incoming requests and routes them to the correct service.
+  # Dashboard available at http://localhost:8080
+  traefik:
+    image: "traefik:v3.0"
+    container_name: "traefik"
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+    ports:
+      - "80:80"
+      - "8080:8080" # Traefik Dashboard
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - omnigraph_net
+
+  # Vector Database: Qdrant
+  # Stores vector embeddings for similarity search.
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./docker/qdrant_data:/qdrant/storage
+    networks:
+      - omnigraph_net
+
+  # Graph Database: Neo4j
+  # Stores graph data with the APOC plugin enabled.
+  neo4j:
+    image: neo4j:5-community
+    container_name: neo4j
+    ports:
+      - "7474:7474" # Neo4j Browser
+      - "7687:7687" # Bolt
+    volumes:
+      - ./docker/neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    networks:
+      - omnigraph_net
+
+  # Local LLM Engine: Ollama with GPU acceleration
+  # Serves local language models like Llama 3.
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./docker/ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - omnigraph_net
+
+  # Observability: Jaeger
+  # Provides distributed tracing. UI at http://localhost:16686
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    ports:
+      - "6831:6831/udp" # Agent
+      - "16686:16686"   # UI
+    networks:
+      - omnigraph_net
+
+  # --- Custom Application Services ---
+
+  # Orchestration Service (Python/FastAPI/LangGraph)
+  orchestration-service:
+    build:
+      context: ./orchestration-service
+      dockerfile: Dockerfile # To be created
+    container_name: orchestration-service
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.orchestration-router.rule=PathPrefix(`/orchestration`)"
+      - "traefik.http.routers.orchestration-router.entrypoints=web"
+      - "traefik.http.services.orchestration-service.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.orchestration-stripprefix.stripprefix.prefixes=/orchestration"
+      - "traefik.http.routers.orchestration-router.middlewares=orchestration-stripprefix"
+    depends_on:
+      qdrant: # Depends on Qdrant starting; the application's retry logic will handle waiting for it to be ready.
+        condition: service_started
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      jaeger:
+        condition: service_started
+    networks:
+      - omnigraph_net
+#
+#  # MCP Tools Service (Go/Fiber)
+#  mcp-tools-service:
+#    build:
+#      context: ./mcp-tools-service
+#      dockerfile: Dockerfile # To be created
+#    container_name: mcp-tools-service
+#    env_file:
+#      - .env
+#    ports:
+#      - "3000:3000"
+#    networks:
+#      - omnigraph_net
