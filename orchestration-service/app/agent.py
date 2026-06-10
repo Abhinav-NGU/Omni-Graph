@@ -338,19 +338,24 @@ async def _graph_search(question: str, broad: bool = False) -> str:
     # This shows direct and second-degree relationships.
     one_hop_cypher = """
     UNWIND $names AS name
-    MATCH (e:Entity)-[r:RELATES_TO]->(n:Entity)
-    WHERE toLower(e.name) CONTAINS toLower(name)
-      AND r.type IS NOT NULL
+    CALL db.index.fulltext.queryNodes('entity_name_index', name + '*')
+    YIELD node AS e, score
+    MATCH (e)-[r:RELATES_TO]->(n:Entity)
+    WHERE r.type IS NOT NULL
     RETURN e.name AS src, r.type AS rel, n.name AS tgt
+    ORDER BY score DESC
     LIMIT $limit
     """
 
     two_hop_cypher = """
     UNWIND $names AS name
-    MATCH (e:Entity)-[r1:RELATES_TO]->(mid:Entity)-[r2:RELATES_TO]->(n:Entity)
-    WHERE toLower(e.name) CONTAINS toLower(name)
-      AND r1.type IS NOT NULL AND r2.type IS NOT NULL
-    RETURN e.name AS src, r1.type AS rel1, mid.name AS mid, r2.type AS rel2, n.name AS tgt
+    CALL db.index.fulltext.queryNodes('entity_name_index', name + '*')
+    YIELD node AS e, score
+    MATCH (e)-[r1:RELATES_TO]->(mid:Entity)-[r2:RELATES_TO]->(n:Entity)
+    WHERE r1.type IS NOT NULL AND r2.type IS NOT NULL
+    RETURN e.name AS src, r1.type AS rel1, mid.name AS mid,
+        r2.type AS rel2, n.name AS tgt
+    ORDER BY score DESC
     LIMIT $limit
     """
 

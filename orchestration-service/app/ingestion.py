@@ -134,9 +134,24 @@ async def upsert_chunks_to_qdrant(
     )
     logger.info("Successfully upserted chunks to Qdrant.")
 
+def normalize_entity_name(name: str) -> str:
+    """
+    Normalize entity names before writing to Neo4j.
+    Prevents duplicates from casing differences.
+    Examples:
+        'elon musk'  → 'Elon Musk'
+        'SPACEX'     → 'Spacex'  (title case)
+        'iPhone 15'  → 'Iphone 15'
+    """
+    if not name:
+        return name
+    # Strip extra whitespace
+    name = " ".join(name.strip().split())
+    # Title case — capitalise first letter of each word
+    return name.title()
 
 async def _create_graph_tx(tx, data: List[Dict[str, Any]]):
-    """Standard Cypher only — no APOC. Relationship type stored as a property."""
+    """Standard Cypher — no APOC. Normalizes entity names before writing."""
     cypher_query = """
     UNWIND $data AS row
     MERGE (source:Entity {name: row.source})
@@ -146,9 +161,17 @@ async def _create_graph_tx(tx, data: List[Dict[str, Any]]):
     ON MATCH  SET rel += row.properties, rel.updated_at = timestamp()
     RETURN count(rel) AS created_rels
     """
-    result = await tx.run(cypher_query, data=data)
+    # Normalize entity names before writing
+    normalized = []
+    for row in data:
+        normalized.append({
+            **row,
+            "source": normalize_entity_name(row["source"]),
+            "target": normalize_entity_name(row["target"]),
+            "relationship": row["relationship"].upper().replace(" ", "_"),
+        })
+    result = await tx.run(cypher_query, data=normalized)
     return await result.consume()
-
 
 async def upsert_graph_to_neo4j(graph: ExtractedGraph):
     if not graph.entities:

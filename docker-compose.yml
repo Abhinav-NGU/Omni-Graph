@@ -138,6 +138,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: omnigraph-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://orchestration-service:8000
+    depends_on:
+      - orchestration-service
+    networks:
+      - omnigraph_net
 
 #
 #  # MCP Tools Service (Go/Fiber)

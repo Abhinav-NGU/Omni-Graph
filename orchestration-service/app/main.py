@@ -317,6 +317,43 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         logger.error(f"Agent failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
+@app.get(
+    "/chat/sessions",
+    tags=["Agent"],
+    summary="List all active sessions with metadata",
+    dependencies=[Depends(require_api_key)],
+)
+async def list_sessions():
+    """Returns all sessions stored in Redis with topic and preview."""
+    try:
+        keys = await db_manager.redis.keys("omnigraph:session:*")
+        sessions = []
+        for key in keys:
+            raw = await db_manager.redis.get(key)
+            if not raw:
+                continue
+            history = json.loads(raw)
+            if not history:
+                continue
+            session_id = key.replace("omnigraph:session:", "")
+            # First user message = topic
+            first_user = next((m for m in history if m["role"] == "user"), None)
+            # Last assistant message = preview
+            last_assistant = next((m for m in reversed(history) if m["role"] == "assistant"), None)
+            topic = first_user["content"] if first_user else "Untitled"
+            topic = topic.replace("?", "").strip()
+            topic = topic[:40] + "…" if len(topic) > 40 else topic
+            preview = last_assistant["content"][:60] + "…" if last_assistant else ""
+            sessions.append({
+                "id": session_id,
+                "topic": topic,
+                "preview": preview,
+                "message_count": len(history),
+            })
+        return {"sessions": sessions}
+    except Exception as e:
+        logger.error(f"Failed to list sessions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete(
     "/chat/{session_id}",
