@@ -1,38 +1,82 @@
 "use client";
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Send, Upload, Trash2, RotateCcw, ChevronUp, ChevronDown } from "lucide-react";
+import { Send, Upload, Trash2, RotateCcw, ChevronUp, ChevronDown, Loader2, GitBranch, KeyRound } from "lucide-react";
 import { Message, Session } from "../lib/types";
 import MessageBubble from "./MessageBubble";
 import SessionSidebar from "./SessionSidebar";
 import IngestModal from "./IngestModal";
+import GraphExplorerModal from "./GraphExplorerModal";
 import HealthBar from "./HealthBar";
 
-interface Props { apiKey: string; }
+interface Props { /* apiKey is now managed internally */ }
+
+interface StoredApiKey {
+  key: string;
+  expires: number; // Expiry timestamp
+}
+
+const API_KEY_STORAGE_KEY = "omnigraph-api-key";
+const API_KEY_EXPIRY_MS = 5 * 60 * 60 * 1000; // 5 hours
 
 function generateTopic(question: string): string {
   const cleaned = question.replace(/[?!.,]/g, "").trim();
   return cleaned.length > 40 ? cleaned.slice(0, 40) + "…" : cleaned;
 }
 
-export default function ChatWindow({ apiKey }: Props) {
+export default function ChatWindow({}: Props) {
+  const [apiKey, setApiKey] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messagesBySession, setMessagesBySession] = useState<Record<string, Message[]>>({});
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(false);       // true only BEFORE first token
+  const [streaming, setStreaming] = useState(false);   // true while tokens arriving
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [loadingSessions, setLoadingSessions] = useState(true);
+  const [ingestStatus, setIngestStatus] = useState<string | null>(null);
   const [showIngest, setShowIngest] = useState(false);
+  const [showGraphExplorer, setShowGraphExplorer] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const activeMessages = activeSessionId ? (messagesBySession[activeSessionId] ?? []) : [];
+  // Use a ref to track the current local session key during streaming
+  const localKeyRef = useRef<string | null>(null);
 
-  // ── Load all sessions from Redis on mount ──────────────────────────────────
+  // ── API Key Management ─────────────────────────────────────────────────────
   useEffect(() => {
-    const loadSessions = async () => {
+    const storedDataJSON = localStorage.getItem(API_KEY_STORAGE_KEY);
+    if (storedDataJSON) {
+      try {
+        const storedData: StoredApiKey = JSON.parse(storedDataJSON);
+        if (storedData.key && storedData.expires > Date.now()) {
+          setApiKey(storedData.key);
+        } else {
+          localStorage.removeItem(API_KEY_STORAGE_KEY);
+        }
+      } catch {
+        localStorage.removeItem(API_KEY_STORAGE_KEY);
+      }
+    }
+  }, []);
+
+  const handleApiKeySubmit = (submittedKey: string) => {
+    if (!submittedKey.trim()) return;
+    const expires = Date.now() + API_KEY_EXPIRY_MS;
+    const dataToStore: StoredApiKey = { key: submittedKey.trim(), expires };
+    localStorage.setItem(API_KEY_STORAGE_KEY, JSON.stringify(dataToStore));
+    setApiKey(submittedKey.trim());
+  };
+
+  const activeMessages = activeSessionId
+    ? (messagesBySession[activeSessionId] ?? [])
+    : [];
+
+  // ── Load sessions from Redis on mount ─────────────────────────────────────
+  useEffect(() => {
+    if (!apiKey) return;
+    const load = async () => {
       setLoadingSessions(true);
       try {
         const res = await fetch("/api/chat/sessions", {
@@ -40,27 +84,26 @@ export default function ChatWindow({ apiKey }: Props) {
         });
         if (!res.ok) return;
         const data = await res.json();
-        const loaded: Session[] = (data.sessions ?? []).map((s: any) => ({
+        setSessions((data.sessions ?? []).map((s: any) => ({
           id: s.id,
           topic: s.topic,
           preview: s.preview,
           messageCount: s.message_count,
           createdAt: new Date(),
           updatedAt: new Date(),
-        }));
-        setSessions(loaded);
+        })));
       } catch (e) {
         console.error("Failed to load sessions:", e);
       } finally {
         setLoadingSessions(false);
       }
     };
-    loadSessions();
+    load();
   }, [apiKey]);
 
   // ── Load history when switching sessions ───────────────────────────────────
   useEffect(() => {
-    if (!activeSessionId || messagesBySession[activeSessionId]) return;
+    if (!activeSessionId || messagesBySession[activeSessionId] || !apiKey) return;
     const load = async () => {
       setLoadingHistory(true);
       try {
@@ -69,12 +112,14 @@ export default function ChatWindow({ apiKey }: Props) {
         });
         if (!res.ok) return;
         const data = await res.json();
-        const msgs: Message[] = (data.history ?? []).map((m: any) => ({
-          role: m.role,
-          content: m.content,
-          timestamp: new Date(),
+        setMessagesBySession(prev => ({
+          ...prev,
+          [activeSessionId]: (data.history ?? []).map((m: any) => ({
+            role: m.role,
+            content: m.content,
+            timestamp: new Date(),
+          })),
         }));
-        setMessagesBySession(prev => ({ ...prev, [activeSessionId]: msgs }));
       } catch (e) {
         console.error("Failed to load history:", e);
       } finally {
@@ -84,20 +129,17 @@ export default function ChatWindow({ apiKey }: Props) {
     load();
   }, [activeSessionId, apiKey]);
 
-  // ── Scroll handling ────────────────────────────────────────────────────────
+  // ── Auto scroll ────────────────────────────────────────────────────────────
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    setIsAtBottom(true);
-  }, [activeMessages.length, loading]);
+    if (isAtBottom) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [activeMessages.length, activeMessages[activeMessages.length - 1]?.content]);
 
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, [activeSessionId]);
+  useEffect(() => { inputRef.current?.focus(); }, [activeSessionId]);
 
   const handleScroll = useCallback(() => {
     if (!containerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
-    setIsAtBottom(scrollHeight - (scrollTop + clientHeight) < 50);
+    setIsAtBottom(scrollHeight - (scrollTop + clientHeight) < 80);
   }, []);
 
   const scrollToBottom = () =>
@@ -110,6 +152,7 @@ export default function ChatWindow({ apiKey }: Props) {
   const selectSession = useCallback((id: string) => setActiveSessionId(id), []);
 
   const deleteSession = useCallback(async (id: string) => {
+    if (!apiKey) return;
     try {
       await fetch(`/api/chat/${id}`, {
         method: "DELETE",
@@ -121,90 +164,232 @@ export default function ChatWindow({ apiKey }: Props) {
     if (activeSessionId === id) setActiveSessionId(null);
   }, [activeSessionId, apiKey]);
 
-  // ── Send message ───────────────────────────────────────────────────────────
+  // ── Update the last message in a session ───────────────────────────────────
+  const updateLastMessage = useCallback((sessionKey: string, update: Partial<Message>) => {
+    setMessagesBySession(prev => {
+      const msgs = [...(prev[sessionKey] ?? [])];
+      if (msgs.length === 0) return prev;
+      msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], ...update };
+      return { ...prev, [sessionKey]: msgs };
+    });
+  }, []);
+
+  // ── Send message via streaming ─────────────────────────────────────────────
   const sendMessage = async () => {
-    if (!input.trim() || loading) return;
+    if (!input.trim() || loading || streaming || !apiKey) return;
+
     const question = input.trim();
     setInput("");
     setLoading(true);
 
-    const userMsg: Message = { role: "user", content: question, timestamp: new Date() };
-    const tempSessionId = activeSessionId;
+    const isNewSession = activeSessionId === null;
+    const localKey = isNewSession ? `local-${Date.now()}` : activeSessionId!;
+    localKeyRef.current = localKey;
 
-    if (tempSessionId) {
-      setMessagesBySession(prev => ({
-        ...prev,
-        [tempSessionId]: [...(prev[tempSessionId] ?? []), userMsg],
-      }));
-    }
+    const userMsg: Message = { role: "user", content: question, timestamp: new Date() };
+    const placeholder: Message = {
+      role: "assistant",
+      content: "",
+      timestamp: new Date(),
+      streaming: true,
+    };
+
+    // Add user message + empty assistant placeholder
+    setMessagesBySession(prev => ({
+      ...prev,
+      [localKey]: [...(prev[localKey] ?? []), userMsg, placeholder],
+    }));
+
+    if (isNewSession) setActiveSessionId(localKey);
+
+    let fullAnswer = "";
+    let reasoning: string[] = [];
+    let sources: any[] = [];
+    let graphContext = "";
+    let strategy = "both";
+    let firstToken = true;
 
     try {
-      const res = await fetch("/api/chat", {
+      const res = await fetch("/api/chat/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
-        body: JSON.stringify({ question, session_id: tempSessionId }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": apiKey,
+        },
+        body: JSON.stringify({
+          question,
+          session_id: isNewSession ? null : activeSessionId,
+        }),
       });
-      const data = await res.json();
-      const sid: string = data.session_id;
 
-      const assistantMsg: Message = {
-        role: "assistant",
-        content: res.ok ? data.answer : `Error: ${data.detail ?? "Unknown error"}`,
-        reasoning: data.reasoning,
-        strategy: data.strategy,
-        sources: data.sources,
-        graph_context: data.graph_context,
-        session_id: sid,
-        timestamp: new Date(),
-      };
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
-      if (!tempSessionId) {
-        // Brand new session
-        const newSession: Session = {
-          id: sid,
-          topic: generateTopic(question),
-          preview: assistantMsg.content.slice(0, 60) + "…",
-          messageCount: 2,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-        setSessions(prev => [newSession, ...prev]);
-        setActiveSessionId(sid);
-        setMessagesBySession(prev => ({ ...prev, [sid]: [userMsg, assistantMsg] }));
-      } else {
-        // Existing session — append assistant reply
-        setMessagesBySession(prev => ({
-          ...prev,
-          [sid]: [...(prev[sid] ?? []), assistantMsg],
-        }));
-        setSessions(prev => prev.map(s => s.id === sid ? {
-          ...s,
-          preview: assistantMsg.content.slice(0, 60) + "…",
-          messageCount: s.messageCount + 2,
-          updatedAt: new Date(),
-        } : s));
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+
+            if (event.type === "reasoning") {
+              reasoning = [...reasoning, event.content];
+
+            } else if (event.type === "sources") {
+              sources = event.content ?? [];
+
+            } else if (event.type === "graph") {
+              graphContext = event.content ?? "";
+
+            } else if (event.type === "token") {
+              // Switch from loading → streaming on first token
+              if (firstToken) {
+                setLoading(false);
+                setStreaming(true);
+                firstToken = false;
+              }
+              fullAnswer += event.content;
+              updateLastMessage(localKey, {
+                content: fullAnswer,
+                reasoning,
+                sources,
+                graph_context: graphContext,
+                streaming: true,
+              });
+
+            } else if (event.type === "done") {
+              const finalSid: string = event.session_id;
+              strategy = event.strategy ?? "both";
+
+              // Guard against empty answer
+              if (!fullAnswer && !event.session_id) {
+                updateLastMessage(localKey, {
+                  content: "No response received. Check backend logs.",
+                  streaming: false,
+                });
+                return;
+              }
+
+              const finalMsg: Message = {
+                role: "assistant",
+                content: fullAnswer || "(no response)",
+                reasoning,
+                strategy,
+                sources,
+                graph_context: graphContext,
+                session_id: finalSid,
+                timestamp: new Date(),
+                streaming: false,
+              };
+
+              if (isNewSession) {
+                const newSession: Session = {
+                  id: finalSid,
+                  topic: generateTopic(question),
+                  preview: fullAnswer.slice(0, 60) + "…",
+                  messageCount: 2,
+                  createdAt: new Date(),
+                  updatedAt: new Date(),
+                };
+                setSessions(prev => [newSession, ...prev]);
+                setActiveSessionId(finalSid);
+                setMessagesBySession(prev => {
+                  const next = { ...prev };
+                  next[finalSid] = [userMsg, finalMsg];
+                  delete next[localKey];
+                  return next;
+                });
+              } else {
+                updateLastMessage(localKey, finalMsg);
+                setSessions(prev => prev.map(s => s.id === localKey ? {
+                  ...s,
+                  preview: fullAnswer.slice(0, 60) + "…",
+                  messageCount: s.messageCount + 2,
+                  updatedAt: new Date(),
+                } : s));
+              }
+
+            } else if (event.type === "error") {
+              updateLastMessage(localKey, {
+                content: `Error: ${event.content}`,
+                streaming: false,
+              });
+            }
+          } catch { /* malformed SSE line */ }
+        }
       }
-    } catch {
-      const errMsg: Message = {
-        role: "assistant",
-        content: "Network error — is the backend running?",
-        timestamp: new Date(),
-      };
-      if (tempSessionId) {
-        setMessagesBySession(prev => ({
-          ...prev,
-          [tempSessionId]: [...(prev[tempSessionId] ?? []), errMsg],
-        }));
-      }
+    } catch (e) {
+      updateLastMessage(localKey, {
+        content: e instanceof Error ? e.message : "Network error — is the backend running?",
+        streaming: false,
+      });
     } finally {
       setLoading(false);
+      setStreaming(false);
+      localKeyRef.current = null;
     }
   };
+
+  const currentTopic = activeSessionId
+    ? sessions.find(s => s.id === activeSessionId)?.topic
+    : null;
+
+  // ── Render API Key Input if needed ─────────────────────────────────────────
+  if (!apiKey) {
+    return (
+      <div className="h-full flex items-center justify-center" style={{ background: "var(--surface)" }}>
+        <div className="w-full max-w-sm p-8 rounded-2xl text-center animate-in fade-in zoom-in-95"
+          style={{ background: "var(--surface2)", border: "1px solid var(--border2)" }}>
+          <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-6"
+            style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+            <KeyRound size={28} style={{ color: "var(--accent)" }} />
+          </div>
+          <h1 className="text-lg font-bold mb-2" style={{ color: "var(--text)" }}>Enter API Key</h1>
+          <p className="text-xs mb-6" style={{ color: "var(--text-muted)" }}>
+            An API key is required to connect to the backend. It will be stored locally for 5 hours.
+          </p>
+          <form onSubmit={(e) => {
+            e.preventDefault();
+            handleApiKeySubmit(e.currentTarget.apiKey.value);
+          }}>
+            <input name="apiKey" type="password"
+              placeholder="your-secret-api-key"
+              className="w-full p-3 rounded-xl text-sm focus:outline-none transition-colors text-center font-mono"
+              style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }} />
+            <button type="submit" className="w-full mt-4 py-3 rounded-xl text-sm font-mono font-medium transition-all hover:scale-[1.01]"
+              style={{ background: "var(--accent-glow)", border: "1px solid var(--accent2)", color: "var(--accent)" }}>
+              Submit & Connect
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="h-full flex flex-col relative z-10">
       <HealthBar apiKey={apiKey} />
+
+      {ingestStatus && (
+        <div
+          className="absolute top-14 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 rounded-lg shadow-xl z-50 animate-in fade-in slide-in-from-top-4"
+          style={{ background: "var(--accent-glow)", border: "1px solid var(--accent2)", color: "var(--accent)" }}
+        >
+          <Loader2 size={14} className="animate-spin" />
+          <p className="text-xs font-mono">{ingestStatus}</p>
+        </div>
+      )}
+
 
       <div className="flex flex-1 overflow-hidden">
         <SessionSidebar
@@ -222,10 +407,10 @@ export default function ChatWindow({ apiKey }: Props) {
           <div className="flex items-center justify-between px-5 py-3 border-b"
             style={{ borderColor: "var(--border)", background: "rgba(13,17,23,0.95)" }}>
             <div>
-              {activeSessionId ? (
+              {currentTopic ? (
                 <>
                   <h2 className="text-sm font-medium" style={{ color: "var(--text)" }}>
-                    {sessions.find(s => s.id === activeSessionId)?.topic ?? "Chat"}
+                    {currentTopic}
                   </h2>
                   <p className="text-xs font-mono mt-0.5" style={{ color: "var(--text-muted)" }}>
                     {activeSessionId}
@@ -243,7 +428,12 @@ export default function ChatWindow({ apiKey }: Props) {
                 style={{ background: "var(--accent-glow)", border: "1px solid var(--accent2)", color: "var(--accent)" }}>
                 <Upload size={10} />Ingest
               </button>
-              {activeSessionId && (
+              <button onClick={() => setShowGraphExplorer(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono transition-all hover:scale-105"
+                style={{ background: "var(--surface2)", border: "1px solid var(--border2)", color: "var(--text-dim)" }}>
+                <GitBranch size={10} />Explore
+              </button>
+              {activeSessionId && sessions.find(s => s.id === activeSessionId) && (
                 <button onClick={() => deleteSession(activeSessionId)}
                   className="p-1.5 rounded-lg transition-colors hover:opacity-70"
                   style={{ color: "var(--text-muted)", border: "1px solid var(--border)" }}>
@@ -286,7 +476,11 @@ export default function ChatWindow({ apiKey }: Props) {
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2 justify-center mt-2">
-                  {["Who is in the knowledge base?", "What relationships exist?", "Summarise the main topics"].map(p => (
+                  {[
+                    "Who is in the knowledge base?",
+                    "What relationships exist?",
+                    "Summarise the main topics",
+                  ].map(p => (
                     <button key={p} onClick={() => setInput(p)}
                       className="px-3 py-1.5 rounded-full text-xs font-mono transition-all hover:scale-105"
                       style={{ background: "var(--surface2)", border: "1px solid var(--border2)", color: "var(--text-dim)" }}>
@@ -299,6 +493,8 @@ export default function ChatWindow({ apiKey }: Props) {
             ) : (
               <>
                 {activeMessages.map((msg, i) => <MessageBubble key={i} msg={msg} />)}
+
+                {/* Show thinking dots only while waiting for FIRST token */}
                 {loading && (
                   <div className="flex gap-3 mb-5">
                     <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-1"
@@ -347,28 +543,54 @@ export default function ChatWindow({ apiKey }: Props) {
                 style={{ background: "var(--surface2)", border: "1px solid var(--border2)" }}>
                 <input ref={inputRef} value={input}
                   onChange={e => setInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }}}
-                  placeholder="Ask a question…"
-                  disabled={loading}
+                  onKeyDown={e => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      sendMessage();
+                    }
+                  }}
+                  placeholder={streaming ? "Receiving response…" : "Ask a question…"}
+                  disabled={loading || streaming}
                   className="flex-1 bg-transparent text-sm focus:outline-none"
                   style={{ color: "var(--text)", fontFamily: "'DM Sans', sans-serif" }} />
                 <span className="text-xs font-mono ml-2" style={{ color: "var(--text-muted)" }}>↵</span>
               </div>
-              <button onClick={sendMessage} disabled={loading || !input.trim()}
+              <button onClick={sendMessage}
+                disabled={loading || streaming || !input.trim()}
                 className="p-3 rounded-xl transition-all hover:scale-105 disabled:opacity-40"
                 style={{
-                  background: !loading && input.trim() ? "var(--accent-glow)" : "var(--surface2)",
-                  border: `1px solid ${!loading && input.trim() ? "var(--accent2)" : "var(--border2)"}`,
-                  color: !loading && input.trim() ? "var(--accent)" : "var(--text-muted)",
+                  background: !loading && !streaming && input.trim() ? "var(--accent-glow)" : "var(--surface2)",
+                  border: `1px solid ${!loading && !streaming && input.trim() ? "var(--accent2)" : "var(--border2)"}`,
+                  color: !loading && !streaming && input.trim() ? "var(--accent)" : "var(--text-muted)",
                 }}>
-                {loading ? <RotateCcw size={14} className="animate-spin" /> : <Send size={14} />}
+                {loading || streaming
+                  ? <RotateCcw size={14} className="animate-spin" />
+                  : <Send size={14} />
+                }
               </button>
             </div>
           </div>
         </div>
       </div>
 
-      {showIngest && <IngestModal apiKey={apiKey} onClose={() => setShowIngest(false)} />}
+      {showIngest && (
+        <IngestModal
+          apiKey={apiKey}
+          onClose={() => setShowIngest(false)}
+          onIngestStarted={(message: string) => {
+            setShowIngest(false);
+            setIngestStatus(message);
+            setTimeout(() => setIngestStatus(null), 30000); // Show for 30s
+          }}
+        />
+      )}
+
+      {showGraphExplorer && (
+        <GraphExplorerModal
+          apiKey={apiKey}
+          onClose={() => setShowGraphExplorer(false)}
+        />
+      )}
     </div>
   );
 }

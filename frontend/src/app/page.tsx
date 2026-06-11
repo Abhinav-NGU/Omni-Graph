@@ -12,7 +12,7 @@ export default function Home() {
 
   return (
     <div className="h-screen flex flex-col overflow-hidden">
-      <ChatWindow apiKey={apiKey} />
+      <ChatWindow />
     </div>
   );
 }

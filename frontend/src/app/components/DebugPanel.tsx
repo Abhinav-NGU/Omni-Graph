@@ -23,6 +23,41 @@ function ScoreBadge({ score }: { score: number }) {
   );
 }
 
+function PathVisualizer({ path }: { path: string }) {
+  const components: React.ReactNode[] = [];
+  const initialSplit = path.split(' --[');
+
+  if (initialSplit.length > 0) {
+    components.push(
+      <span key="node-0" className="px-2 py-1 rounded text-center" style={{ background: 'var(--border)', color: 'var(--text-dim)', border: '1px solid var(--border2)' }}>
+        {initialSplit[0].trim()}
+      </span>
+    );
+  }
+
+  for (let i = 1; i < initialSplit.length; i++) {
+    const relAndNode = initialSplit[i].split(']-->');
+    if (relAndNode.length !== 2) continue;
+    const rel = relAndNode[0];
+    const node = relAndNode[1];
+
+    components.push(
+      <div key={`rel-${i}`} className="flex items-center gap-1 mx-2 flex-shrink-0" style={{ color: 'var(--green)' }}>
+        <div className="h-px w-4" style={{ background: 'var(--green)', opacity: 0.3 }} />
+        <span className="text-xs font-bold tracking-wider" style={{ fontSize: '9px' }}>{rel}</span>
+        <div className="h-px w-4" style={{ background: 'var(--green)', opacity: 0.3 }} />
+        <span>→</span>
+      </div>
+    );
+    components.push(
+      <span key={`node-${i}`} className="px-2 py-1 rounded text-center" style={{ background: 'var(--border)', color: 'var(--text-dim)', border: '1px solid var(--border2)' }}>
+        {node.trim()}
+      </span>
+    );
+  }
+  return <div className="flex items-center p-1">{components}</div>;
+}
+
 export default function DebugPanel({ reasoning, strategy, sources, graph_context, session_id }: Props) {
   const stratColor = strategy === "both" ? "var(--yellow)" : strategy === "graph" ? "var(--green)" : "var(--accent)";
 
@@ -101,15 +136,11 @@ export default function DebugPanel({ reasoning, strategy, sources, graph_context
               <GitBranch size={9} />
               <span className="uppercase tracking-wider" style={{ fontSize: "10px" }}>graph paths</span>
             </div>
-            <pre className="p-2 rounded-lg leading-relaxed overflow-x-auto"
-              style={{
-                background: "var(--surface2)",
-                border: "1px solid var(--border)",
-                color: "var(--green)",
-                fontSize: "11px",
-              }}>
-              {graph_context}
-            </pre>
+            <div className="p-2 rounded-lg space-y-2 overflow-x-auto" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+              {graph_context.split('\n').map((path, i) => (
+                path.trim() && <PathVisualizer key={i} path={path} />
+              ))}
+            </div>
           </div>
         )}
       </div>

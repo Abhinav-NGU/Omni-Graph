@@ -43,6 +43,8 @@ from langchain_ollama.chat_models import ChatOllama
 from langchain_ollama.embeddings import OllamaEmbeddings
 from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
+from hybrid_search import hybrid_search as _hybrid_search
+from compressor import compress_chunks
 
 from core.config import settings
 from core.db import db_manager
@@ -232,57 +234,13 @@ async def node_route(state: AgentState) -> AgentState:
 # Fetches context from the selected source(s) using two retrieval strategies.
 
 async def _vector_search(question: str) -> List[Dict[str, Any]]:
-    """
-    Retrieve semantically similar text chunks from Qdrant vector database.
-    
-    Steps:
-    1. Embed the user's question into a vector
-    2. Query Qdrant for TOP_K most similar chunks
-    3. Filter by MIN_SCORE threshold to remove low-confidence results
-    4. Return ranked chunks with scores
-    
-    Args:
-        question: User's question text
-    
-    Returns:
-        List of dicts with keys: 'id', 'text', 'score' (similarity 0-1)
-    """
+    """Hybrid search — BM25 + vector + RRF. Replaces pure vector search."""
     try:
-        # Step 1: Generate embedding vector for the question
-        query_vector = await _embedder().aembed_query(question)
-        client = db_manager.qdrant_client
-
-        # Verify collection exists
-        collections = await client.get_collections()
-        names = [c.name for c in collections.collections]
-        if QDRANT_COLLECTION_NAME not in names:
-            logger.warning("Qdrant collection not found.")
-            return []
-
-        # Step 2: Query Qdrant for similar vectors
-        response = await client.query_points(
-            collection_name=QDRANT_COLLECTION_NAME,
-            query=query_vector,
-            limit=TOP_K,
-            with_payload=True,  # Include text payload with results
-        )
-        results = response.points
-
-        # Step 3: Filter and format results
-        chunks = []
-        for hit in results:
-            text = (hit.payload or {}).get("text", "")
-            # Only include chunks above MIN_SCORE threshold
-            if text and hit.score >= MIN_SCORE:
-                chunks.append({"id": str(hit.id), "text": text, "score": hit.score})
-
-        # Sort by relevance score (highest first)
-        chunks.sort(key=lambda x: x["score"], reverse=True)
-        logger.info(f"Vector search: {len(chunks)} chunks (before filter: {len(results)}).")
-        return chunks
-
+        results = await _hybrid_search(question)
+        logger.info(f"Hybrid search returned {len(results)} chunks.")
+        return results
     except Exception as e:
-        logger.error(f"Vector search failed: {e}", exc_info=True)
+        logger.error(f"Hybrid search failed: {e}", exc_info=True)
         return []
     
 
@@ -396,41 +354,42 @@ async def _graph_search(question: str, broad: bool = False) -> str:
         return ""
 
 
-async def node_retrieve(state: AgentState) -> AgentState:
-    """
-    Retrieval node: Fetch context based on the routed strategy.
-    
-    Based on state['strategy']:
-    - "vector": Retrieve only text chunks via semantic search
-    - "graph": Retrieve only entity relationships from knowledge graph
-    - "both": Retrieve from both sources
-    
-    Args:
-        state: Current agent state with 'strategy' set by routing node
-    
-    Returns:
-        Updated state with 'chunks' and 'graph_ctx' populated
-    """
+async def node_retrieve(state: AgentState, compress: bool = True) -> AgentState:
     strategy = state["strategy"]
     question = state["question"]
     retries = state.get("retries", 0)
     reasoning = state.get("reasoning", [])
-    
-    # On retry, use broad=True to extract multi-word phrases for more coverage
     broad = retries > 0
 
     chunks: List[Dict[str, Any]] = []
     graph_ctx = ""
 
-    # Retrieve from vector database if strategy includes vector search
     if strategy in ("vector", "both"):
         chunks = await _vector_search(question)
-        reasoning.append(f"Vector search returned {len(chunks)} chunks.")
+        reasoning.append(f"Hybrid search returned {len(chunks)} chunks.")
 
-    # Retrieve from knowledge graph if strategy includes graph search
+        # Only compress when not streaming — avoids conflicting Ollama calls
+        if chunks and compress:
+            from compressor import compress_chunks
+            compressed = await compress_chunks(question, chunks)
+            if compressed:
+                reduction = round(
+                    (1 - sum(len(c["text"]) for c in compressed) /
+                     max(sum(len(c["text"]) for c in chunks), 1)) * 100
+                )
+                reasoning.append(
+                    f"Contextual compression: {len(chunks)} → {len(compressed)} chunks "
+                    f"({reduction}% reduction)."
+                )
+                chunks = compressed
+            else:
+                reasoning.append("Compression dropped all chunks — using originals.")
+
     if strategy in ("graph", "both"):
         graph_ctx = await _graph_search(question, broad=broad)
-        reasoning.append(f"Graph search returned {'paths' if graph_ctx else 'no paths'}.")
+        reasoning.append(
+            f"Graph search returned {'paths' if graph_ctx else 'no paths'}."
+        )
 
     return {**state, "chunks": chunks, "graph_ctx": graph_ctx, "reasoning": reasoning}
 

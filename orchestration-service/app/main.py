@@ -3,11 +3,15 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, Response, status, HTTPException, BackgroundTasks, File, UploadFile, Depends
-from ingest_loaders import load_pdf, load_url
+from pydantic import BaseModel, Field
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+import asyncio
+import json
 
 from core.db import db_manager
 from core.utils import check_ollama_models
+from ingest_loaders import load_pdf, load_url
 from ingestion import ingest_text, QDRANT_COLLECTION_NAME
 from query import run_query_pipeline
 from agent import run_agent, clear_session, get_history
@@ -87,6 +91,22 @@ class ChatResponse(BaseModel):
 
 class IngestUrlRequest(BaseModel):
     url: str
+
+
+class GraphNode(BaseModel):
+    id: str
+    label: str
+
+
+class GraphEdge(BaseModel):
+    from_node: str = Field(..., alias="from")
+    to_node: str = Field(..., alias="to")
+    label: str
+
+
+class GraphVisual(BaseModel):
+    nodes: List[GraphNode]
+    edges: List[GraphEdge]
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
@@ -259,6 +279,28 @@ async def clear_graph():
         logger.error(f"Failed to clear Neo4j: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to clear graph: {str(e)}")
 
+@app.get(
+    "/graph/visual_search",
+    tags=["Graph"],
+    response_model=GraphVisual,
+    dependencies=[Depends(require_api_key)],
+    summary="Search for a node and return its neighborhood for visualization",
+)
+async def visual_search_endpoint(q: str):
+    """
+    Searches for a node by name (case-insensitive, partial match) and returns
+    its 1-hop neighborhood in a format suitable for graph visualization.
+    """
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query parameter 'q' must not be empty.")
+    try:
+        from query import search_node_for_visual
+        graph_data = await search_node_for_visual(q)
+        return graph_data
+    except Exception as e:
+        logger.error(f"Visual graph search for '{q}' failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Graph search failed: {str(e)}")
+
 
 @app.post(
     "/query",
@@ -283,6 +325,165 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
         logger.error(f"Query pipeline failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Query pipeline error: {str(e)}")
 
+
+@app.post(
+    "/chat/stream",
+    tags=["Agent"],
+    summary="Streaming agentic chat — tokens arrive in real time",
+    dependencies=[Depends(require_api_key)],
+)
+async def chat_stream_endpoint(request: ChatRequest):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question must not be empty.")
+
+    async def event_stream():
+        logger.info("=== STREAM START ===")
+        try:
+            from langchain_ollama.chat_models import ChatOllama
+            from core.config import settings
+            from agent import (
+                get_or_create_session, get_history, append_to_history,
+                node_route, node_retrieve, node_grade, AgentState,
+            )
+
+            # Step 1 — session
+            logger.info("STREAM: getting session...")
+            sid = get_or_create_session(request.session_id)
+            history = await get_history(sid)
+            logger.info(f"STREAM: session={sid}, history_len={len(history)}")
+
+            yield f"data: {json.dumps({'type': 'reasoning', 'content': 'Session ready'})}\n\n"
+
+            # Step 2 — build state
+            state: AgentState = {
+                "question": request.question,
+                "session_id": sid,
+                "history": history,
+                "strategy": "both",
+                "chunks": [],
+                "graph_ctx": "",
+                "context_sufficient": False,
+                "retries": 0,
+                "answer": "",
+                "reasoning": [],
+            }
+
+            # Step 3 — route
+            logger.info("STREAM: routing...")
+            state = await node_route(state)
+            logger.info(f"STREAM: strategy={state['strategy']}")
+            yield f"data: {json.dumps({'type': 'reasoning', 'content': 'Strategy: ' + state['strategy']})}\n\n"
+
+            # Step 4 — retrieve
+            logger.info("STREAM: retrieving...")
+            for attempt in range(3):
+                logger.info(f"STREAM: retrieve attempt {attempt+1}")
+                state = await node_retrieve(state, compress=False)
+                logger.info(f"STREAM: got {len(state['chunks'])} chunks")
+                state = await node_grade(state)
+                logger.info(f"STREAM: sufficient={state['context_sufficient']}")
+                if state.get("context_sufficient"):
+                    break
+
+            # Step 5 — send reasoning
+            for step in state.get("reasoning", []):
+                yield f"data: {json.dumps({'type': 'reasoning', 'content': step})}\n\n"
+
+            # Step 6 — send sources
+            sources = state.get("chunks", [])
+            safe_sources = [
+                {
+                    "id": str(c.get("id", "")),
+                    "text": str(c.get("text", "")),
+                    "score": float(c.get("score", 0)),
+                }
+                for c in sources
+            ]
+            logger.info(f"STREAM: sending {len(safe_sources)} sources")
+            yield f"data: {json.dumps({'type': 'sources', 'content': safe_sources})}\n\n"
+
+            # Step 7 — send graph
+            graph_ctx = state.get("graph_ctx", "")
+            if graph_ctx:
+                yield f"data: {json.dumps({'type': 'graph', 'content': graph_ctx})}\n\n"
+
+            # Step 8 — build prompt
+            chunk_block = (
+                "\n\n---\n\n".join(
+                    f"[Chunk {i+1} | score {c.get('score', 0):.4f}]\n{c.get('text', '')}"
+                    for i, c in enumerate(sources)
+                ) if sources else "(no context found)"
+            )
+            graph_section = (
+                f"### Graph Context\n{graph_ctx}" if graph_ctx
+                else "### Graph Context\n(none found)"
+            )
+            history_block = ""
+            if history:
+                lines = [
+                    f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+                    for m in history[-6:]
+                ]
+                history_block = "\n### Conversation History\n" + "\n".join(lines)
+
+            user_message = (
+                f"### Text Chunks\n{chunk_block}\n\n"
+                f"{graph_section}"
+                f"{history_block}\n\n"
+                f"### Question\n{request.question}"
+            )
+            system_prompt = (
+                "You are a knowledgeable assistant. "
+                "Answer accurately and concisely using the provided context. "
+                "Do not fabricate facts."
+            )
+
+            # Step 9 — stream tokens
+            logger.info("STREAM: starting LLM stream...")
+            llm = ChatOllama(
+                model="llama3.2",
+                base_url=settings.OLLAMA_BASE_URL,
+                temperature=0.2,
+            )
+
+            full_answer = ""
+            token_count = 0
+            async for token in llm.astream([
+                ("system", system_prompt),
+                ("human", user_message),
+            ]):
+                text = token.content
+                if text:
+                    full_answer += text
+                    token_count += 1
+                    yield f"data: {json.dumps({'type': 'token', 'content': text})}\n\n"
+
+            logger.info(f"STREAM: LLM done, {token_count} tokens, {len(full_answer)} chars")
+
+            # Step 10 — save history
+            await append_to_history(sid, "user", request.question)
+            await append_to_history(sid, "assistant", full_answer)
+
+            # Step 11 — done
+            yield f"data: {json.dumps({'type': 'done', 'session_id': sid, 'strategy': state.get('strategy', 'both')})}\n\n"
+            logger.info("=== STREAM END ===")
+
+        except Exception as e:
+            logger.error(f"=== STREAM EXCEPTION: {e} ===", exc_info=True)
+            try:
+                yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 @app.post(
     "/chat",

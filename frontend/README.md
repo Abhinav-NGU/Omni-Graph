@@ -3,15 +3,14 @@
 A modern Next.js frontend for the OmniGraph chatbot and knowledge graph system.
 
 ## Features
-
-- 🤖 AI-powered chat with multi-turn conversation support
-- 📊 Real-time health monitoring of backend services
-- 📝 Text ingestion interface
-- 🌐 URL content ingestion
-- 🔐 API key authentication
-- 🎨 Dark-themed UI with Tailwind CSS
-- 🔍 Debug panel for service status inspection
-
+- **Real-time Conversational AI**: Streaming responses render as tokens arrive for a fluid user experience.
+- **Full Session Management**: A persistent sidebar lists all conversations, allowing users to create, switch between, and delete sessions.
+- **Advanced Ingestion**: A multi-tab modal for ingesting raw text, PDF files, or content from URLs, with visual feedback when tasks are queued.
+- **Interactive Graph Explorer**: A dedicated modal to search for entities and visualize their connections in the knowledge graph with a force-directed layout.
+- **Rich Debug Panel**: Per-message inspection panel showing the agent's reasoning trace, retrieved vector sources with relevance scores, and a visualizer for graph paths.
+- **Persistent Authentication**: API key is stored securely in the browser's local storage with a 5-hour expiry, avoiding the need for re-entry on every visit.
+- **Live Health Monitoring**: A top bar provides at-a-glance status of all backend services (Neo4j, Qdrant, Ollama).
+- **Modern UI/UX**: A dark-themed, command-center aesthetic built with Tailwind CSS, featuring loading states, quick prompts, and scroll controls.
 ## Prerequisites
 
 - Node.js 18+
@@ -65,12 +64,13 @@ docker run -p 3000:3000 \
 
 ## Components
 
-- **ChatWindow** — Main chat interface with multi-turn support
-- **MessageBubble** — Individual message display with sources and reasoning
-- **IngestPanel** — Text and URL ingestion forms
-- **DebugPanel** — Backend service status inspection
-- **HealthBar** — Real-time service health indicator
-
+- **ChatWindow**: The core component orchestrating the entire UI, including state management for sessions, messages, and API key persistence.
+- **SessionSidebar**: Lists all conversations and handles session creation, selection, and deletion.
+- **MessageBubble**: Renders individual user and assistant messages, and contains the collapsible `DebugPanel`.
+- **DebugPanel**: Provides a detailed, per-message trace of the agent's reasoning, retrieved sources, and graph context.
+- **IngestModal**: A multi-tab modal for ingesting content via text, PDF upload, or URL.
+- **GraphExplorerModal**: An interactive tool for searching and visualizing the knowledge graph.
+- **HealthBar**: A persistent header showing the real-time health of backend services.
 ## Environment Variables
 
 | Variable | Description |

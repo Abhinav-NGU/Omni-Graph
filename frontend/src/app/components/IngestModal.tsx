@@ -5,12 +5,13 @@ import { Upload, Link, FileText, Check, AlertCircle, Loader, X } from "lucide-re
 interface Props {
   apiKey: string;
   onClose: () => void;
+  onIngestStarted: (message: string) => void; // Add this line
 }
 
 type Tab = "text" | "pdf" | "url";
 type Status = "idle" | "loading" | "success" | "error";
 
-export default function IngestModal({ apiKey, onClose }: Props) {
+export default function IngestModal({ apiKey, onClose, onIngestStarted }: Props) {
   const [tab, setTab] = useState<Tab>("text");
   const [text, setText] = useState("");
   const [url, setUrl] = useState("");
@@ -44,11 +45,13 @@ export default function IngestModal({ apiKey, onClose }: Props) {
       }
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail ?? "Failed");
-      setStatus("success");
+
       const chars = data.characters_extracted;
-      setMessage(chars
+      const successMessage = chars
         ? `Queued — ${chars.toLocaleString()} characters extracted`
-        : data.message ?? "Queued successfully");
+        : data.message ?? "Queued successfully";
+
+      onIngestStarted(successMessage);
       setText(""); setUrl(""); setFile(null);
     } catch (e: any) {
       setStatus("error");

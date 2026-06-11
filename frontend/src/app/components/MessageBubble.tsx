@@ -7,10 +7,10 @@ import DebugPanel from "./DebugPanel";
 export default function MessageBubble({ msg }: { msg: Message }) {
   const [showDebug, setShowDebug] = useState(false);
   const isUser = msg.role === "user";
+  const isStreaming = (msg as any).streaming && !msg.content;
   const hasDebug = !isUser && msg.reasoning && msg.reasoning.length > 0;
   const sourceCount = msg.sources?.length ?? 0;
   const hasGraph = !!msg.graph_context;
-
   return (
     <div className={`flex gap-3 mb-5 animate-slide-up ${isUser ? "flex-row-reverse" : "flex-row"}`}>
 
@@ -42,6 +42,9 @@ export default function MessageBubble({ msg }: { msg: Message }) {
             borderTopLeftRadius: "4px",
           }}>
           {msg.content}
+          {isStreaming && (
+            <span className="inline-block w-1.5 h-4 ml-1 bg-current rounded-sm align-text-bottom animate-pulse" />
+          )}
         </div>
 
         {/* Debug toggle */}

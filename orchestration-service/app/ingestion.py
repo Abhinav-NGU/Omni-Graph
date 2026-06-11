@@ -9,7 +9,8 @@ import re
 
 from langchain_ollama.chat_models import ChatOllama
 from langchain_ollama.embeddings import OllamaEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# from langchain_text_splitters import RecursiveCharacterTextSplitter
+from chunker import semantic_chunk
 from qdrant_client import models, AsyncQdrantClient
 
 from core.config import settings
@@ -34,12 +35,11 @@ def _get_graph_extraction_llm() -> ChatOllama:
 
 
 async def chunk_text(text: str) -> List[str]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-    )
-    return splitter.split_text(text)
+    """
+    Semantic chunking — splits on topic boundaries instead of
+    fixed character count. Falls back gracefully for short texts.
+    """
+    return await semantic_chunk(text)
 
 
 async def generate_embeddings(chunks: List[str]) -> List[List[float]]:
@@ -90,6 +90,14 @@ Text:
         """)
         raw = re.sub(r"```(?:json)?|```", "", response.content).strip()
         data = json.loads(raw)
+        # Pre-validate and filter entities to prevent Pydantic errors
+        # from malformed LLM output (e.g., empty dicts in the list).
+        if "entities" in data and isinstance(data["entities"], list):
+            data["entities"] = [
+                e for e in data["entities"]
+                if isinstance(e, dict) and e.get("source") and e.get("target") and e.get("relationship")
+            ]
+
         result = ExtractedGraph(**data)
         logger.info(f"Manual parse got {len(result.entities)} entities.")
         return result
@@ -217,10 +225,10 @@ async def ingest_text(text: str):
     for i, result in enumerate(graphs):
         if isinstance(result, Exception):
             logger.error(f"Graph extraction failed for chunk {i+1}: {result}")
-            continue                              # ← this line was missing
+            continue
         if result.entities:
-            await upsert_graph_to_neo4j(result)  # ← this line was missing
+            await upsert_graph_to_neo4j(result)
         else:
-            logger.info(f"No entities found in chunk {i+1}.")  # ← missing
+            logger.info(f"No entities found in chunk {i+1}.")
 
-    logger.info("Ingestion pipeline completed successfully.")  # ← missing
+    logger.info("Ingestion pipeline completed successfully.")
