@@ -7,7 +7,7 @@ deliver fast, accurate, and context-aware answers.
 
 The system features a LangGraph-powered agent that intelligently routes queries, performs hybrid search and contextual compression for optimal context retrieval, and streams responses in real-time. With a complete microservices stack including Neo4j, Qdrant, and Ollama, plus a full-featured chat UI, OmniGraph provides a robust foundation for building and exploring complex knowledge domains.
 
-## Status: Phase 8e Complete ✅
+## Status: Phase 7 Complete ✅
 
 ---
 
@@ -23,7 +23,7 @@ The system features a LangGraph-powered agent that intelligently routes queries,
 | **Jaeger** | Go | Distributed tracing and observability |
 | **orchestration-service** | Python/FastAPI | Core service — all pipelines and agent logic |
 | **frontend** | Next.js | Chat UI with debug panels and session sidebar |
-| **mcp-tools-service** | Go/Fiber | *(Planned)* External tools for the agent |
+| **mcp-tools-service** | Go/Fiber | External tools for the agent |
 
 ---
 
@@ -73,35 +73,43 @@ The system features a LangGraph-powered agent that intelligently routes queries,
 - Real-time health status bar (Neo4j, Qdrant, Redis, Ollama)
 - Scroll controls, quick prompt suggestions, animated typing indicator
 
-### Phase 8a — Neo4j Optimisation
+### Phase 6a — Neo4j Optimisation
 - Fulltext index on `Entity.name` — 10-100x faster graph queries
 - Entity name normalisation before write — prevents duplicate nodes
   from casing differences ("Elon Musk" vs "elon musk")
 - Relationship type normalisation to UPPER_SNAKE_CASE
 
-### Phase 8b — Semantic Chunking
+### Phase 6b — Semantic Chunking
 - Replaced fixed-size character chunking with topic-aware splitting
 - Embeds sentences and finds topic boundaries via cosine similarity drops
 - Chunks contain complete thoughts — no sentences split mid-fact
 - Configurable similarity threshold, min/max chunk sizes
 
-### Phase 8c — Hybrid Search
+### Phase 6c — Hybrid Search
 - BM25 keyword search + vector semantic search run in parallel
 - Results merged with Reciprocal Rank Fusion (RRF)
 - Chunks appearing in both lists bubble to top — fixes name/keyword matching
 - Directly fixed "Abhinav Bindra scores lower than Elon Musk" problem
 
-### Phase 8d — Contextual Compression
+### Phase 6d — Contextual Compression
 - After retrieval, LLM extracts only relevant sentences from each chunk
 - Reduces context passed to final LLM by 60-90%
 - Drops chunks with no relevant content entirely
 - Sharper, more accurate answers with less hallucination
 
-### Phase 8e — Response Streaming
+### Phase 6e — Response Streaming
 - `/chat/stream` endpoint streams tokens via Server-Sent Events
 - Frontend renders tokens as they arrive — no more waiting 15s for silence
 - Streams reasoning steps, sources, graph paths, then tokens in order
 - Falls back gracefully on network errors
+
+### Phase 7 — Advanced Agent Tools & Chat Uploads
+- `/chat/upload` endpoint injects PDFs directly into the agent's conversation memory.
+- Background-threaded PDF parsing prevents blocking the FastAPI event loop.
+- **Active LLM Grader**: Enforces strict entity matching to prevent hallucinations on partial names.
+- **Ambiguity Resolution**: Agent proactively asks for clarification on vague queries.
+- **Agent Tools**: Programmatic timezone conversion and dynamic web search fallback for missing data.
+- **UI Enhancements**: One-shot file attachments, document rendering in chat bubbles, and silent API key auto-restore.
 
 ---
 
@@ -117,6 +125,7 @@ The system features a LangGraph-powered agent that intelligently routes queries,
 | POST | `/query` | ✅ | Simple RAG query |
 | POST | `/chat` | ✅ | Agentic chat with memory |
 | POST | `/chat/stream` | ✅ | Streaming agentic chat (SSE) |
+| POST | `/chat/upload` | ✅ | Upload PDF directly into chat session |
 | GET | `/chat/sessions` | ✅ | List all sessions |
 | GET | `/chat/{id}/history` | ✅ | Get session history |
 | DELETE | `/chat/{id}` | ✅ | Clear a session |
@@ -245,5 +254,6 @@ RETURN a.name, r.type, b.name LIMIT 25
 | 8c | ✅ | Hybrid Search (BM25 + Vector + RRF) |
 | 8d | ✅ | Contextual Compression |
 | 8e | ✅ | Response Streaming |
-| 6 | 🔄 | mcp-tools-service (Go/Fiber) |
+| 9 | ✅ | Advanced Agent Tools & Chat Uploads |
+| 6 | ✅ | mcp-tools-service (Go/Fiber) |
 | 7 | 🔄 | Observability (OpenTelemetry + Jaeger) |

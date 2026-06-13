@@ -98,6 +98,7 @@ services:
       context: ./orchestration-service
       dockerfile: Dockerfile # To be created
     container_name: orchestration-service
+    restart: always
     env_file:
       - .env
     ports:
@@ -143,6 +144,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: omnigraph-frontend
+    restart: always
     ports:
       - "3000:3000"
     environment:
@@ -152,16 +154,16 @@ services:
     networks:
       - omnigraph_net
 
-#
-#  # MCP Tools Service (Go/Fiber)
-#  mcp-tools-service:
-#    build:
-#      context: ./mcp-tools-service
-#      dockerfile: Dockerfile # To be created
-#    container_name: mcp-tools-service
-#    env_file:
-#      - .env
-#    ports:
-#      - "3000:3000"
-#    networks:
-#      - omnigraph_net
+  # MCP Tools Service (Go/Fiber)
+  mcp-tools-service:
+    build:
+      context: ./mcp-tools-service
+      dockerfile: Dockerfile
+    container_name: mcp-tools-service
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "8081:8080" # Exposed externally as 8081; internally listens on 8080
+    networks:
+      - omnigraph_net

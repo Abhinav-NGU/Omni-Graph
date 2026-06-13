@@ -45,6 +45,8 @@ from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 from hybrid_search import hybrid_search as _hybrid_search
 from compressor import compress_chunks
+from mcp_tools import call_tool
+
 
 from core.config import settings
 from core.db import db_manager
@@ -183,41 +185,40 @@ def _embedder() -> OllamaEmbeddings:
 # Strategy determines which databases (or both) will be queried in the retrieval stage.
 
 async def node_route(state: AgentState) -> AgentState:
-    """
-    Route node: Classify the question to determine retrieval strategy.
-    
-    Uses simple keyword matching to categorize:
-    - Graph questions: Ask about relationships, connections, links between entities
-    - Vector questions: Ask for explanations, definitions, descriptions
-    - Ambiguous: Use both strategies for complex questions
-    
-    Args:
-        state: Current agent state
-    
-    Returns:
-        Updated state with 'strategy' field set and reasoning appended
-    """
     question = state["question"].lower()
     reasoning = state.get("reasoning", [])
 
-    # Keywords indicating relationship/entity-centric questions
+    # Questions that need live data — route to tool_call directly
+    tool_signals = [
+        "current time", "what time", "time now", "time is it",
+        "what date", "today's date", "current date",
+        "calculate", "compute", "solve",
+        "multiply", "divide", "add", "subtract",
+        "+ ", "- ", "* ", "/ ", "=",
+        "convert", "timezone", "to ist", "to utc", "time in",
+        "utc to", "ist to",
+        "search", "web", "internet", "google", "look up"
+    ]
+
     graph_signals = [
         "how does", "relate", "connection", "connected",
         "relationship", "between", "link", "path", "who works",
         "who founded", "who leads", "part of",
     ]
-    
-    # Keywords indicating descriptive/definitional questions
+
     vector_signals = [
-        "what is", "explain", "describe", "summarise", "summary",
+        "explain", "describe", "summarise", "summary",
         "tell me about", "definition", "how does it work",
     ]
 
+    is_tool = any(sig in question for sig in tool_signals)
     is_graph = any(sig in question for sig in graph_signals)
     is_vector = any(sig in question for sig in vector_signals)
 
-    # Determine strategy: if both signals found, use both; otherwise specific strategy
-    if is_graph and not is_vector:
+    if is_tool and not is_graph and not is_vector:
+        strategy = "tool_only"
+        reasoning.append("Routed to: tool-only (live data or calculation question detected)")
+    elif is_graph and not is_vector:
         strategy = "graph"
         reasoning.append("Routed to: graph-only (relationship question detected)")
     elif is_vector and not is_graph:
@@ -228,7 +229,6 @@ async def node_route(state: AgentState) -> AgentState:
         reasoning.append("Routed to: both (complex or ambiguous question)")
 
     return {**state, "strategy": strategy, "reasoning": reasoning}
-
 
 # ========== STAGE 2: RETRIEVAL NODE ==========
 # Fetches context from the selected source(s) using two retrieval strategies.
@@ -364,11 +364,15 @@ async def node_retrieve(state: AgentState, compress: bool = True) -> AgentState:
     chunks: List[Dict[str, Any]] = []
     graph_ctx = ""
 
+    # tool_only skips all retrieval — goes straight to grade which routes to tool_call
+    if strategy == "tool_only":
+        reasoning.append("Tool-only strategy — skipping knowledge base retrieval.")
+        return {**state, "chunks": [], "graph_ctx": "", "reasoning": reasoning}
+
     if strategy in ("vector", "both"):
         chunks = await _vector_search(question)
         reasoning.append(f"Hybrid search returned {len(chunks)} chunks.")
 
-        # Only compress when not streaming — avoids conflicting Ollama calls
         if chunks and compress:
             from compressor import compress_chunks
             compressed = await compress_chunks(question, chunks)
@@ -393,72 +397,82 @@ async def node_retrieve(state: AgentState, compress: bool = True) -> AgentState:
 
     return {**state, "chunks": chunks, "graph_ctx": graph_ctx, "reasoning": reasoning}
 
-
 # ========== STAGE 3: GRADING NODE ==========
 # Evaluates whether retrieved context is sufficient for answer synthesis.
 # If insufficient, triggers a retry with an expanded strategy (e.g., vector-only → both).
 
 async def node_grade(state: AgentState) -> AgentState:
-    """
-    Grading node: Assess if context quality is sufficient.
-    
-    Logic:
-    - If no chunks AND no graph paths: context insufficient
-      - If retries < MAX_RETRIES: Set strategy to 'both' and increment retries
-      - If retries >= MAX_RETRIES: Proceed with best effort (empty context)
-    - Otherwise: Mark context as sufficient
-    
-    Args:
-        state: Current agent state with 'chunks' and 'graph_ctx'
-    
-    Returns:
-        Updated state with 'context_sufficient' flag and possibly escalated strategy
-    """
     chunks = state.get("chunks", [])
     graph_ctx = state.get("graph_ctx", "")
     retries = state.get("retries", 0)
+    strategy = state.get("strategy", "both")
     reasoning = state.get("reasoning", [])
+    question = state["question"]
 
-    # Determine if context is sufficient: at least chunks OR graph paths
-    sufficient = bool(chunks) or bool(graph_ctx)
+    # tool_only strategy — always insufficient, force tool_call
+    if strategy == "tool_only":
+        reasoning.append("Tool-only strategy — routing to tool call.")
+        return {**state, "context_sufficient": False, "retries": MAX_RETRIES, "reasoning": reasoning}
 
-    # If insufficient and retries available: escalate strategy and retry retrieval
+    if not chunks and not graph_ctx:
+        sufficient = False
+    else:
+        # Active LLM Grading
+        context_text = "\n\n".join([c.get("text", "") for c in chunks])
+        if graph_ctx:
+            context_text += f"\n\nGraph Context:\n{graph_ctx}"
+            
+        prompt = f"""You are a strict grader. Determine if the provided context contains the answer to the user's question.
+
+RULES:
+- If the context contains the answer, output YES.
+- If the context DOES NOT contain the answer, output NO.
+- CRITICAL: If the question asks about a specific person (e.g., 'Abhinav Bindra') and the context is about someone else with the same first name (e.g., 'Abhinav Nair'), you MUST output NO. Do not assume typos.
+
+Question: {question}
+
+Context:
+{context_text}
+
+Output ONLY YES or NO."""
+        
+        try:
+            response = await _llm().ainvoke([("human", prompt)])
+            sufficient = "YES" in response.content.strip().upper()
+        except Exception as e:
+            logger.error(f"Grader LLM failed: {e}")
+            sufficient = True
+
     if not sufficient and retries < MAX_RETRIES:
         reasoning.append(
-            f"Context insufficient (retry {retries + 1}/{MAX_RETRIES}). "
+            f"Context graded as insufficient (retry {retries + 1}/{MAX_RETRIES}). "
             "Escalating to 'both'."
         )
         return {
             **state,
             "context_sufficient": False,
-            "strategy": "both",  # Escalate to combined retrieval
+            "strategy": "both",
             "retries": retries + 1,
             "reasoning": reasoning,
         }
 
-    # If insufficient after max retries: give up and proceed
     if not sufficient:
-        reasoning.append("Context still insufficient after max retries.")
+        reasoning.append("Context graded as insufficient after max retries — trying tools.")
     else:
         reasoning.append(
-            f"Context sufficient: {len(chunks)} chunks, "
+            f"Context graded as sufficient: {len(chunks)} chunks, "
             f"{'graph paths found' if graph_ctx else 'no graph paths'}."
         )
 
-    return {**state, "context_sufficient": True, "reasoning": reasoning}
-
+    return {**state, "context_sufficient": sufficient, "reasoning": reasoning}
 
 def grade_router(state: AgentState) -> str:
-    """
-    Routing function: Decide next step after grading.
-    
-    Returns:
-    - "retrieve": Go back to retrieval node (context was insufficient, retrying)
-    - "synthesise": Proceed to answer synthesis (context is sufficient or max retries reached)
-    """
     if not state.get("context_sufficient", True):
-        return "retrieve"  # Retry retrieval
-    return "synthesise"  # Proceed to synthesis
+        if state.get("retries", 0) < MAX_RETRIES:
+            return "retrieve"
+        else:
+            return "tool_call"   # ← exhausted retries, try web search
+    return "synthesise"
 
 
 # ========== STAGE 4: SYNTHESIS NODE ==========
@@ -471,7 +485,12 @@ You are a knowledgeable assistant with access to:
 3. The conversation history with this user.
 
 Use all available context to answer accurately and concisely.
-If the context doesn't contain enough information, say so honestly — do not fabricate.
+You may use your internal knowledge for general facts and common sense.
+Do NOT perform your own math or timezone calculations; strictly output the result provided in the context chunks or tool outputs.
+ENTITY ALIASES: Understand that variations of a name (e.g., "Elon", "Elon Musk", "Elon R. Musk") usually refer to the same entity. However, entirely distinct full names (e.g., "Abhinav Nair" vs "Abhinav Bindra") are completely different people.
+For domain-specific knowledge, if the context doesn't contain enough information, say so honestly — do not fabricate.
+Do NOT use introductory phrases like "Based on the provided context" or "According to the information". Provide the answer straight.
+CRITICAL: If a question is ambiguous or lacks necessary details (e.g., asking about a person using only a first name like "Abhinav"), you MUST politely ask the user to clarify (e.g., "Did you mean Abhinav Nair?"). Do not just output a bare name.
 """
 
 
@@ -517,10 +536,16 @@ async def node_synthesise(state: AgentState) -> AgentState:
 
     # ─────── Format 3: Conversation history ───────
     # Include last 6 messages for context (avoid token limit issues)
+    # Uploaded PDFs (Attachments) bypass the 6-message sliding window.
     history_block = ""
     if history:
+        attachments = [m for m in history if m["content"].startswith("[ATTACHMENT:") or m["content"].startswith("[System: User uploaded a PDF")]
+        recent = [m for m in history if not (m["content"].startswith("[ATTACHMENT:") or m["content"].startswith("[System: User uploaded a PDF"))][-6:]
+        
         lines = []
-        for msg in history[-6:]:  # Last 6 messages (3 turns)
+        for msg in attachments:
+            lines.append(f"User uploaded document:\n{msg['content']}")
+        for msg in recent:
             role = "User" if msg["role"] == "user" else "Assistant"
             lines.append(f"{role}: {msg['content']}")
         history_block = "\n### Conversation History\n" + "\n".join(lines)
@@ -549,66 +574,202 @@ async def node_synthesise(state: AgentState) -> AgentState:
     return {**state, "answer": answer, "reasoning": reasoning}
 
 
+from mcp_tools import call_tool
+
+def execute_timezone_conversion(question: str) -> str:
+    """Programmatic function to convert timezones or get current time in a timezone."""
+    import re
+    from datetime import datetime, timedelta
+
+    tz_offsets = {
+        "utc": 0, "gmt": 0, "ist": 5.5,
+        "est": -5, "edt": -4, "pst": -8, "pdt": -7,
+        "cst": -6, "cdt": -5, "mst": -7, "mdt": -6,
+        "bst": 1, "cet": 1, "cest": 2, "aest": 10, "aedt": 11
+    }
+    
+    question_lower = question.lower()
+    found_tzs = []
+    for word in re.findall(r'\b[a-z]{3,4}\b', question_lower):
+        if word in tz_offsets and word not in found_tzs:
+            found_tzs.append(word)
+            
+    time_match = re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b', question_lower)
+    
+    # Explicit Conversion: e.g. "10:00 AM UTC to IST"
+    if len(found_tzs) >= 2 and time_match:
+        from_tz = found_tzs[0]
+        to_tz = found_tzs[1]
+        
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2)) if time_match.group(2) else 0
+        ampm = time_match.group(3)
+        
+        if ampm:
+            ampm = ampm.lower()
+            if ampm == "pm" and hour < 12: hour += 12
+            elif ampm == "am" and hour == 12: hour = 0
+            
+        diff_hours = tz_offsets[to_tz] - tz_offsets[from_tz]
+        total_minutes = hour * 60 + minute + int(diff_hours * 60)
+        
+        normalized_minutes = total_minutes % (24 * 60)
+        res_hour = normalized_minutes // 60
+        res_minute = normalized_minutes % 60
+        
+        res_ampm = "AM" if res_hour < 12 else "PM"
+        display_hour = res_hour if res_hour <= 12 else res_hour - 12
+        if display_hour == 0: display_hour = 12
+            
+        original_time = f"{int(time_match.group(1)):02d}:{minute:02d} {ampm.upper() if ampm else ''}".strip()
+        converted_time = f"{int(display_hour):02d}:{int(res_minute):02d} {res_ampm}"
+        
+        return f"Conversion Result: {original_time} {from_tz.upper()} is {converted_time} {to_tz.upper()} ({res_hour:02d}:{int(res_minute):02d} 24h format)."
+    
+    # Current Time Mapping: e.g. "What time is it in IST?"
+    current_utc = datetime.utcnow()
+    context = [f"Current UTC time: {current_utc.strftime('%Y-%m-%d %H:%M:%S')}"]
+    for tz in found_tzs:
+        if tz in ("utc", "gmt"): continue
+        tz_time = current_utc + timedelta(hours=tz_offsets[tz])
+        context.append(f"Current time in {tz.upper()}: {tz_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+    return "\n".join(context)
+
+async def node_tool_call(state: AgentState) -> AgentState:
+    """
+    Calls the appropriate mcp-tools-service tool based on the question.
+    Fired when knowledge base retrieval found nothing OR strategy is tool_only.
+    """
+    question = state["question"]
+    question_lower = question.lower()
+    reasoning = state.get("reasoning", [])
+
+    import re
+
+    # Detect which tool to use
+    time_signals = ["current time", "what time", "time now", "time is it", "what date", "today"]
+    calc_signals = ["calculate", "compute", "solve", "+ ", "- ", "* ", "/ ", "=",
+                    "multiply", "divide", "add", "subtract"]
+    tz_signals = ["convert", "timezone", "to ist", "to utc", "time in"]
+
+    is_tz = any(sig in question_lower for sig in tz_signals)
+    if not is_tz and re.search(r'\b(ist|utc|gmt|pst|est|cet|bst)\b', question_lower) and ("time" in question_lower or "convert" in question_lower):
+        is_tz = True
+
+    if is_tz:
+        tool = "timezone_converter"
+        tool_input = question
+        reasoning.append("Tool selected: timezone_converter")
+    elif any(sig in question_lower for sig in time_signals):
+        tool = "current_time"
+        tool_input = ""
+        reasoning.append("Tool selected: current_time")
+    elif any(sig in question_lower for sig in calc_signals):
+        # Extract math expression — take everything after keywords
+        tool = "calculator"
+        for prefix in ["calculate", "compute", "solve"]:
+            if prefix in question_lower:
+                tool_input = question_lower.split(prefix, 1)[-1].strip().rstrip("?")
+                break
+        else:
+            tool_input = question
+        reasoning.append(f"Tool selected: calculator with input '{tool_input}'")
+    else:
+        tool = "web_search"
+        tool_input = question
+        reasoning.append(f"Tool selected: web_search for '{question[:50]}'")
+
+    if tool == "timezone_converter":
+        logger.info(f"Executing local timezone conversion for: '{question}'")
+        result_text = execute_timezone_conversion(question)
+        result = {"answer": result_text}
+    else:
+        logger.info(f"Calling tool '{tool}' with input: '{tool_input}'")
+        result = await call_tool(tool, tool_input)
+
+    if "error" in result and result["error"]:
+        reasoning.append(f"Tool '{tool}' failed: {result['error']}")
+        return {**state, "context_sufficient": True, "reasoning": reasoning}
+
+    # Format result as a synthetic chunk
+    result_text = _format_tool_result(tool, result)
+    synthetic_chunk = {
+        "id": f"tool_{tool}",
+        "text": f"[Tool: {tool}]\n{result_text}",
+        "score": 1.0,
+        "in_vector": False,
+        "in_bm25": False,
+    }
+
+    reasoning.append(f"Tool '{tool}' returned a result successfully.")
+    return {
+        **state,
+        "chunks": [synthetic_chunk],
+        "context_sufficient": True,
+        "reasoning": reasoning,
+    }
+
+
+def _format_tool_result(tool: str, result: dict) -> str:
+    """Format tool results into readable text for the LLM."""
+    if tool == "timezone_converter":
+        return result.get("answer", "")
+    elif tool == "current_time":
+        return (
+            f"Current time: {result.get('utc', 'unknown')} UTC\n"
+            f"Date: {result.get('date', 'unknown')}\n"
+            f"Time: {result.get('time', 'unknown')} UTC"
+        )
+    elif tool == "calculator":
+        return (
+            f"Expression: {result.get('expression', 'unknown')}\n"
+            f"Result: {result.get('result', 'unknown')}"
+        )
+    elif tool == "web_search":
+        answer = result.get("answer", "")
+        if not answer or not str(answer).strip():
+            return "No web search results found."
+        source = result.get("source", "")
+        url = result.get("url", "")
+        text = f"Search result: {answer}"
+        if source:
+            text += f"\nSource: {source}"
+        if url:
+            text += f"\nURL: {url}"
+        return text
+    else:
+        return str(result)
+
+
 # ========== LANGGRAPH COMPILATION ==========
 # Assemble the state machine and define transition rules between nodes.
 
 def build_agent() -> StateGraph:
-    """
-    Construct the LangGraph state machine.
-    
-    Graph structure:
-                    ┌──────────────┐
-                    │   route      │ (Determine strategy)
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │  retrieve    │ (Fetch context)
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │    grade     │ (Check sufficiency)
-                    └──────┬───────┘
-                           │
-                    [grade_router]
-                    /           \
-               "retrieve"    "synthesise"
-                /                  \
-            (RETRY)          ┌──────▼────────┐
-                            │  synthesise    │ (Generate answer)
-                            └──────┬────────┘
-                                   │
-                                 [END]
-    
-    Returns:
-        Compiled StateGraph ready for invocation
-    """
     graph = StateGraph(AgentState)
 
-    # Add all nodes
     graph.add_node("route", node_route)
     graph.add_node("retrieve", node_retrieve)
     graph.add_node("grade", node_grade)
+    graph.add_node("tool_call", node_tool_call)
     graph.add_node("synthesise", node_synthesise)
 
-    # Set entry point
     graph.set_entry_point("route")
-    
-    # Define sequential edges
-    graph.add_edge("route", "retrieve")      # Route → Retrieve
-    graph.add_edge("retrieve", "grade")      # Retrieve → Grade
-    
-    # Conditional edge: after grading, router function determines next node
+    graph.add_edge("route", "retrieve")
+    graph.add_edge("retrieve", "grade")
     graph.add_conditional_edges(
         "grade",
         grade_router,
-        {"retrieve": "retrieve", "synthesise": "synthesise"},  # Retry or proceed
+        {
+            "retrieve": "retrieve",
+            "tool_call": "tool_call",
+            "synthesise": "synthesise",
+        },
     )
-    
-    # Synthesis leads to end
+    graph.add_edge("tool_call", "synthesise")
     graph.add_edge("synthesise", END)
 
     return graph.compile()
-
 
 # Instantiate the compiled agent at module load time
 _agent = build_agent()

@@ -1,6 +1,6 @@
 "use client";
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Send, Upload, Trash2, RotateCcw, ChevronUp, ChevronDown, Loader2, GitBranch, KeyRound } from "lucide-react";
+import { Send, Upload, Trash2, RotateCcw, ChevronUp, ChevronDown, Loader2, GitBranch, Paperclip, X } from "lucide-react";
 import { Message, Session } from "../lib/types";
 import MessageBubble from "./MessageBubble";
 import SessionSidebar from "./SessionSidebar";
@@ -10,21 +10,29 @@ import HealthBar from "./HealthBar";
 
 interface Props { /* apiKey is now managed internally */ }
 
-interface StoredApiKey {
-  key: string;
-  expires: number; // Expiry timestamp
-}
-
-const API_KEY_STORAGE_KEY = "omnigraph-api-key";
-const API_KEY_EXPIRY_MS = 5 * 60 * 60 * 1000; // 5 hours
-
 function generateTopic(question: string): string {
   const cleaned = question.replace(/[?!.,]/g, "").trim();
   return cleaned.length > 40 ? cleaned.slice(0, 40) + "…" : cleaned;
 }
 
 export default function ChatWindow({}: Props) {
-  const [apiKey, setApiKey] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState<string>(
+    process.env.NEXT_PUBLIC_API_KEY || "changeme"
+  );
+
+  // ── Restore API key from local storage ────────────────────────────────────
+  useEffect(() => {
+    const storedDataJSON = localStorage.getItem("omnigraph-api-key");
+    if (storedDataJSON) {
+      try {
+        const storedData = JSON.parse(storedDataJSON);
+        if (storedData.key) {
+          setApiKey(storedData.key);
+        }
+      } catch {}
+    }
+  }, []);
+
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messagesBySession, setMessagesBySession] = useState<Record<string, Message[]>>({});
@@ -37,37 +45,11 @@ export default function ChatWindow({}: Props) {
   const [showIngest, setShowIngest] = useState(false);
   const [showGraphExplorer, setShowGraphExplorer] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
+  const [attachedFile, setAttachedFile] = useState<File | null>(null);
+  const [isExtracting, setIsExtracting] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-
-  // Use a ref to track the current local session key during streaming
-  const localKeyRef = useRef<string | null>(null);
-
-  // ── API Key Management ─────────────────────────────────────────────────────
-  useEffect(() => {
-    const storedDataJSON = localStorage.getItem(API_KEY_STORAGE_KEY);
-    if (storedDataJSON) {
-      try {
-        const storedData: StoredApiKey = JSON.parse(storedDataJSON);
-        if (storedData.key && storedData.expires > Date.now()) {
-          setApiKey(storedData.key);
-        } else {
-          localStorage.removeItem(API_KEY_STORAGE_KEY);
-        }
-      } catch {
-        localStorage.removeItem(API_KEY_STORAGE_KEY);
-      }
-    }
-  }, []);
-
-  const handleApiKeySubmit = (submittedKey: string) => {
-    if (!submittedKey.trim()) return;
-    const expires = Date.now() + API_KEY_EXPIRY_MS;
-    const dataToStore: StoredApiKey = { key: submittedKey.trim(), expires };
-    localStorage.setItem(API_KEY_STORAGE_KEY, JSON.stringify(dataToStore));
-    setApiKey(submittedKey.trim());
-  };
 
   const activeMessages = activeSessionId
     ? (messagesBySession[activeSessionId] ?? [])
@@ -176,15 +158,173 @@ export default function ChatWindow({}: Props) {
 
   // ── Send message via streaming ─────────────────────────────────────────────
   const sendMessage = async () => {
-    if (!input.trim() || loading || streaming || !apiKey) return;
+    if ((!input.trim() && !attachedFile) || loading || streaming || isExtracting || !apiKey) return;
 
     const question = input.trim();
     setInput("");
-    setLoading(true);
 
     const isNewSession = activeSessionId === null;
     const localKey = isNewSession ? `local-${Date.now()}` : activeSessionId!;
-    localKeyRef.current = localKey;
+
+    // ──────────────────────────────────────────────────────────
+    // 1. Handle One-Shot: PDF + Question together (Await & Extract)
+    // ──────────────────────────────────────────────────────────
+    if (attachedFile && question) {
+      const formData = new FormData();
+      formData.append("file", attachedFile);
+      formData.append("question", question);
+      if (activeSessionId) formData.append("session_id", activeSessionId);
+
+      const attachMsg: Message = { role: "user", content: `📎 Attached: ${attachedFile.name}`, timestamp: new Date() };
+      const userMsg: Message = { role: "user", content: question, timestamp: new Date() };
+      setMessagesBySession(prev => ({
+        ...prev,
+        [localKey]: [...(prev[localKey] ?? []), attachMsg, userMsg],
+      }));
+
+      setAttachedFile(null);
+      setIsExtracting(true);
+      if (isNewSession) setActiveSessionId(localKey);
+
+      try {
+        const res = await fetch("/api/chat/upload", {
+          method: "POST",
+          headers: { "X-API-Key": apiKey },
+          body: formData,
+        });
+
+        const data = await res.json();
+        setIsExtracting(false);
+
+        if (res.ok && data.answer) {
+          const finalSid: string = data.session_id;
+          const finalMsg: Message = {
+            role: "assistant",
+            content: data.answer,
+            sources: data.sources || [],
+            reasoning: data.reasoning || [],
+            graph_context: data.graph_context || "",
+            session_id: finalSid,
+            strategy: data.strategy || "both",
+            timestamp: new Date(),
+          };
+
+          if (isNewSession) {
+            const newSession: Session = {
+              id: finalSid,
+              topic: generateTopic(question),
+              preview: data.answer.slice(0, 60) + "…",
+              messageCount: 2,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            setSessions(prev => [newSession, ...prev]);
+            setActiveSessionId(prev => prev === localKey ? finalSid : prev);
+            setMessagesBySession(prev => {
+              const next = { ...prev };
+              next[finalSid] = [attachMsg, userMsg, finalMsg];
+              delete next[localKey];
+              return next;
+            });
+          } else {
+            setMessagesBySession(prev => ({
+              ...prev,
+              [localKey]: [...(prev[localKey] ?? []), finalMsg]
+            }));
+            setSessions(prev => prev.map(s => s.id === localKey ? {
+              ...s,
+              preview: data.answer.slice(0, 60) + "…",
+              messageCount: s.messageCount + 2,
+              updatedAt: new Date(),
+            } : s));
+          }
+        } else {
+          console.error("Backend error:", data.detail);
+        }
+      } catch (error) {
+        setIsExtracting(false);
+        console.error("Failed to extract answer from PDF:", error);
+      }
+      return;
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // 2. Handle PDF Upload ONLY (No question attached)
+    // ──────────────────────────────────────────────────────────
+    if (attachedFile && !question) {
+      const formData = new FormData();
+      formData.append("file", attachedFile);
+      if (activeSessionId) formData.append("session_id", activeSessionId);
+
+      const fileName = attachedFile.name;
+      setIsExtracting(true);
+      if (isNewSession) setActiveSessionId(localKey);
+      
+      const attachMsg: Message = { role: "user", content: `📎 Attached: ${fileName}`, timestamp: new Date() };
+      setMessagesBySession(prev => ({
+        ...prev,
+        [localKey]: [...(prev[localKey] ?? []), attachMsg],
+      }));
+      
+      try {
+        const res = await fetch("/api/chat/upload", {
+          method: "POST",
+          headers: { "X-API-Key": apiKey },
+          body: formData,
+        });
+        
+        const data = await res.json();
+        setIsExtracting(false);
+
+        const finalSid = data.session_id || localKey;
+        const confirmMsg: Message = { 
+          role: "assistant", 
+          content: `I have received and read the PDF '${fileName}'. How can I help you with it?`,
+          timestamp: new Date()
+        };
+
+        if (isNewSession && data.session_id) {
+          setActiveSessionId(finalSid);
+          const newSession: Session = {
+            id: finalSid,
+            topic: `Uploaded ${fileName}`,
+            preview: confirmMsg.content.slice(0, 60) + "…",
+            messageCount: 2,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          setSessions(prev => [newSession, ...prev]);
+          setMessagesBySession(prev => {
+            const next = { ...prev };
+            next[finalSid] = [attachMsg, confirmMsg];
+            delete next[localKey];
+            return next;
+          });
+        } else {
+          setMessagesBySession(prev => ({
+            ...prev,
+            [localKey]: [...(prev[localKey] ?? []), confirmMsg]
+          }));
+          setSessions(prev => prev.map(s => s.id === localKey ? {
+            ...s,
+            preview: confirmMsg.content.slice(0, 60) + "…",
+            messageCount: s.messageCount + 2,
+            updatedAt: new Date(),
+          } : s));
+        }
+        
+        setAttachedFile(null);
+      } catch (error) {
+        setIsExtracting(false);
+        console.error("Failed to upload PDF:", error);
+      }
+      return;
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // 3. Handle Standard Question ONLY (Standard Streaming)
+    // ──────────────────────────────────────────────────────────
+    setLoading(true);
 
     const userMsg: Message = { role: "user", content: question, timestamp: new Date() };
     const placeholder: Message = {
@@ -194,7 +334,6 @@ export default function ChatWindow({}: Props) {
       streaming: true,
     };
 
-    // Add user message + empty assistant placeholder
     setMessagesBySession(prev => ({
       ...prev,
       [localKey]: [...(prev[localKey] ?? []), userMsg, placeholder],
@@ -210,7 +349,7 @@ export default function ChatWindow({}: Props) {
     let firstToken = true;
 
     try {
-      const res = await fetch("/api/chat/stream", {
+      const res = await fetch("/api/chat/stream", {   // ← /chat/stream not /chat
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -251,13 +390,13 @@ export default function ChatWindow({}: Props) {
               graphContext = event.content ?? "";
 
             } else if (event.type === "token") {
-              // Switch from loading → streaming on first token
               if (firstToken) {
                 setLoading(false);
                 setStreaming(true);
                 firstToken = false;
               }
               fullAnswer += event.content;
+              // Update the placeholder (last message) with streaming content
               updateLastMessage(localKey, {
                 content: fullAnswer,
                 reasoning,
@@ -269,15 +408,6 @@ export default function ChatWindow({}: Props) {
             } else if (event.type === "done") {
               const finalSid: string = event.session_id;
               strategy = event.strategy ?? "both";
-
-              // Guard against empty answer
-              if (!fullAnswer && !event.session_id) {
-                updateLastMessage(localKey, {
-                  content: "No response received. Check backend logs.",
-                  streaming: false,
-                });
-                return;
-              }
 
               const finalMsg: Message = {
                 role: "assistant",
@@ -301,14 +431,17 @@ export default function ChatWindow({}: Props) {
                   updatedAt: new Date(),
                 };
                 setSessions(prev => [newSession, ...prev]);
-                setActiveSessionId(finalSid);
+                setActiveSessionId(prev => prev === localKey ? finalSid : prev);
                 setMessagesBySession(prev => {
                   const next = { ...prev };
-                  next[finalSid] = [userMsg, finalMsg];
+                  const msgs = next[localKey] ? [...next[localKey]] : [];
+                  if (msgs.length > 0) msgs[msgs.length - 1] = finalMsg;
+                  next[finalSid] = msgs.length > 0 ? msgs : [userMsg, finalMsg];
                   delete next[localKey];
                   return next;
                 });
               } else {
+                // Finalise the last message
                 updateLastMessage(localKey, finalMsg);
                 setSessions(prev => prev.map(s => s.id === localKey ? {
                   ...s,
@@ -335,45 +468,12 @@ export default function ChatWindow({}: Props) {
     } finally {
       setLoading(false);
       setStreaming(false);
-      localKeyRef.current = null;
     }
   };
 
   const currentTopic = activeSessionId
     ? sessions.find(s => s.id === activeSessionId)?.topic
     : null;
-
-  // ── Render API Key Input if needed ─────────────────────────────────────────
-  if (!apiKey) {
-    return (
-      <div className="h-full flex items-center justify-center" style={{ background: "var(--surface)" }}>
-        <div className="w-full max-w-sm p-8 rounded-2xl text-center animate-in fade-in zoom-in-95"
-          style={{ background: "var(--surface2)", border: "1px solid var(--border2)" }}>
-          <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-6"
-            style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
-            <KeyRound size={28} style={{ color: "var(--accent)" }} />
-          </div>
-          <h1 className="text-lg font-bold mb-2" style={{ color: "var(--text)" }}>Enter API Key</h1>
-          <p className="text-xs mb-6" style={{ color: "var(--text-muted)" }}>
-            An API key is required to connect to the backend. It will be stored locally for 5 hours.
-          </p>
-          <form onSubmit={(e) => {
-            e.preventDefault();
-            handleApiKeySubmit(e.currentTarget.apiKey.value);
-          }}>
-            <input name="apiKey" type="password"
-              placeholder="your-secret-api-key"
-              className="w-full p-3 rounded-xl text-sm focus:outline-none transition-colors text-center font-mono"
-              style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }} />
-            <button type="submit" className="w-full mt-4 py-3 rounded-xl text-sm font-mono font-medium transition-all hover:scale-[1.01]"
-              style={{ background: "var(--accent-glow)", border: "1px solid var(--accent2)", color: "var(--accent)" }}>
-              Submit & Connect
-            </button>
-          </form>
-        </div>
-      </div>
-    );
-  }
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -512,6 +612,13 @@ export default function ChatWindow({}: Props) {
                     </div>
                   </div>
                 )}
+
+              {isExtracting && (
+                <div className="flex items-center text-accent space-x-2 p-2 opacity-80 animate-pulse">
+                  <Loader2 className="animate-spin" size={18} />
+                  <span className="text-sm font-mono">Reading PDF and extracting answer…</span>
+                </div>
+              )}
                 <div ref={bottomRef} />
               </>
             )}
@@ -541,6 +648,32 @@ export default function ChatWindow({}: Props) {
             <div className="flex gap-2 items-center">
               <div className="flex-1 flex items-center rounded-2xl px-4 py-2.5"
                 style={{ background: "var(--surface2)", border: "1px solid var(--border2)" }}>
+                
+                {/* Hidden File Input */}
+                <input 
+                  type="file" 
+                  id="chat-pdf-upload" 
+                  accept=".pdf" 
+                  className="hidden" 
+                  onChange={(e) => setAttachedFile(e.target.files?.[0] || null)} 
+                />
+                
+                {/* Attachment Button */}
+                <label 
+                  htmlFor="chat-pdf-upload" 
+                  className={`mr-2 p-2 cursor-pointer rounded-lg transition-colors ${isExtracting ? 'opacity-50 pointer-events-none' : 'hover:bg-surface'}`}
+                >
+                  <Paperclip size={18} className="text-text-muted hover:text-accent" />
+                </label>
+
+                {/* Show attached file pill if exists */}
+                {attachedFile && (
+                  <div className="mr-2 flex items-center gap-1 bg-accent-glow text-accent text-xs px-2 py-1 rounded-md">
+                    <span className="truncate max-w-[100px]">{attachedFile.name}</span>
+                    <X size={14} className="cursor-pointer hover:text-red-400" onClick={() => setAttachedFile(null)} />
+                  </div>
+                )}
+
                 <input ref={inputRef} value={input}
                   onChange={e => setInput(e.target.value)}
                   onKeyDown={e => {
@@ -550,20 +683,20 @@ export default function ChatWindow({}: Props) {
                     }
                   }}
                   placeholder={streaming ? "Receiving response…" : "Ask a question…"}
-                  disabled={loading || streaming}
+                  disabled={loading || streaming || isExtracting}
                   className="flex-1 bg-transparent text-sm focus:outline-none"
                   style={{ color: "var(--text)", fontFamily: "'DM Sans', sans-serif" }} />
                 <span className="text-xs font-mono ml-2" style={{ color: "var(--text-muted)" }}>↵</span>
               </div>
               <button onClick={sendMessage}
-                disabled={loading || streaming || !input.trim()}
+                disabled={loading || streaming || isExtracting || (!input.trim() && !attachedFile)}
                 className="p-3 rounded-xl transition-all hover:scale-105 disabled:opacity-40"
                 style={{
-                  background: !loading && !streaming && input.trim() ? "var(--accent-glow)" : "var(--surface2)",
-                  border: `1px solid ${!loading && !streaming && input.trim() ? "var(--accent2)" : "var(--border2)"}`,
-                  color: !loading && !streaming && input.trim() ? "var(--accent)" : "var(--text-muted)",
+                  background: !loading && !streaming && !isExtracting && (input.trim() || attachedFile) ? "var(--accent-glow)" : "var(--surface2)",
+                  border: `1px solid ${!loading && !streaming && !isExtracting && (input.trim() || attachedFile) ? "var(--accent2)" : "var(--border2)"}`,
+                  color: !loading && !streaming && !isExtracting && (input.trim() || attachedFile) ? "var(--accent)" : "var(--text-muted)",
                 }}>
-                {loading || streaming
+                {loading || streaming || isExtracting
                   ? <RotateCcw size={14} className="animate-spin" />
                   : <Send size={14} />
                 }

@@ -8,6 +8,7 @@ Provides two loaders:
 
 import logging
 import io
+import asyncio
 from typing import Optional
 
 import httpx
@@ -23,7 +24,8 @@ async def load_pdf(file_bytes: bytes) -> str:
     Returns the full text as a single string.
     """
     logger.info("Extracting text from PDF...")
-    try:
+
+    def _extract_sync():
         reader = PdfReader(io.BytesIO(file_bytes))
         pages = []
         for i, page in enumerate(reader.pages):
@@ -36,8 +38,13 @@ async def load_pdf(file_bytes: bytes) -> str:
         if not pages:
             raise ValueError("PDF contains no extractable text. It may be scanned/image-based.")
 
-        full_text = "\n\n".join(pages)
-        logger.info(f"PDF extracted: {len(reader.pages)} pages, {len(full_text)} characters.")
+        return "\n\n".join(pages), len(reader.pages)
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Offload the CPU-bound parsing to a background thread to avoid blocking the event loop
+        full_text, num_pages = await loop.run_in_executor(None, _extract_sync)
+        logger.info(f"PDF extracted: {num_pages} pages, {len(full_text)} characters.")
         return full_text
 
     except Exception as e:

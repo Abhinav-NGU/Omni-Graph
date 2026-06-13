@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Response, status, HTTPException, BackgroundTasks, File, UploadFile, Depends
+from fastapi import FastAPI, Response, status, HTTPException, BackgroundTasks, File, UploadFile, Depends, Form
 from pydantic import BaseModel, Field
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
@@ -14,7 +14,7 @@ from core.utils import check_ollama_models
 from ingest_loaders import load_pdf, load_url
 from ingestion import ingest_text, QDRANT_COLLECTION_NAME
 from query import run_query_pipeline
-from agent import run_agent, clear_session, get_history
+from agent import run_agent, clear_session, get_history, get_or_create_session, append_to_history
 
 from auth import require_api_key
 
@@ -420,10 +420,15 @@ async def chat_stream_endpoint(request: ChatRequest):
             )
             history_block = ""
             if history:
-                lines = [
-                    f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
-                    for m in history[-6:]
-                ]
+                attachments = [m for m in history if m["content"].startswith("[ATTACHMENT:") or m["content"].startswith("[System: User uploaded a PDF")]
+                recent = [m for m in history if not (m["content"].startswith("[ATTACHMENT:") or m["content"].startswith("[System: User uploaded a PDF"))][-6:]
+                
+                lines = []
+                for m in attachments:
+                    lines.append(f"User uploaded document:\n{m['content']}")
+                for m in recent:
+                    role = "User" if m["role"] == "user" else "Assistant"
+                    lines.append(f"{role}: {m['content']}")
                 history_block = "\n### Conversation History\n" + "\n".join(lines)
 
             user_message = (
@@ -435,7 +440,12 @@ async def chat_stream_endpoint(request: ChatRequest):
             system_prompt = (
                 "You are a knowledgeable assistant. "
                 "Answer accurately and concisely using the provided context. "
-                "Do not fabricate facts."
+                "You may use your internal knowledge for general facts and common sense. "
+                "Do NOT perform your own math or timezone calculations; strictly output the result provided in the context chunks or tool outputs. "
+                "ENTITY ALIASES: Understand that variations of a name (e.g., 'Elon', 'Elon Musk', 'Elon R. Musk') usually refer to the same entity. However, entirely distinct full names (e.g., 'Abhinav Nair' vs 'Abhinav Bindra') are completely different people. "
+                "Do not fabricate facts. "
+                "Do NOT use introductory phrases like 'Based on the provided context' or 'According to the information'. Provide the answer straight. "
+                "CRITICAL: If a question is ambiguous or lacks necessary details (e.g., asking about a person using only a first name like 'Abhinav'), you MUST politely ask the user to clarify (e.g., 'Did you mean Abhinav Nair?'). Do not just output a bare name."
             )
 
             # Step 9 — stream tokens
@@ -518,6 +528,66 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         logger.error(f"Agent failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
+@app.post(
+    "/chat/upload",
+    tags=["Agent"],
+    dependencies=[Depends(require_api_key)],
+    summary="Upload a PDF directly into a chat session's context, and optionally ask a question",
+)
+async def chat_upload_endpoint(
+    file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+    question: Optional[str] = Form(None),
+):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only .pdf files are supported.")
+    
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        text = await load_pdf(file_bytes)
+        
+        # Cap at ~15,000 characters to avoid exceeding the LLM context window limit
+        max_chars = 15000
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n\n... [Truncated: PDF too long, showing first {max_chars} chars]"
+
+        if session_id in ("", "null", "undefined"):
+            session_id = None
+            
+        sid = get_or_create_session(session_id)
+        
+        # Inject the PDF text directly into the conversation history
+        msg = f"[ATTACHMENT: {file.filename}]\n\n{text}"
+        await append_to_history(sid, "user", msg)
+
+        if question and question.strip():
+            # If a question is provided, run the agent immediately
+            result = await run_agent(question=question.strip(), session_id=sid)
+            return {
+                "message": f"PDF '{file.filename}' processed.",
+                "session_id": sid,
+                "answer": result["answer"],
+                "sources": result.get("sources", []),
+                "graph_context": result.get("graph_context", ""),
+                "reasoning": result.get("reasoning", []),
+                "strategy": result.get("strategy", "both"),
+            }
+        else:
+            await append_to_history(sid, "assistant", f"I have received and read the PDF '{file.filename}'. How can I help you with it?")
+            return {
+                "message": f"PDF '{file.filename}' added to session.",
+                "session_id": sid,
+                "characters": len(text)
+            }
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Chat PDF upload failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(e)}")
+
 @app.get(
     "/chat/sessions",
     tags=["Agent"],
@@ -556,17 +626,6 @@ async def list_sessions():
         logger.error(f"Failed to list sessions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete(
-    "/chat/{session_id}",
-    tags=["Agent"],
-    dependencies=[Depends(require_api_key)],
-    summary="Clear a chat session's conversation history",
-)
-async def clear_chat_session(session_id: str):
-    await clear_session(session_id)          # ← await
-    return {"message": f"Session '{session_id}' cleared."}
-
-
 @app.get(
     "/chat/{session_id}/history",
     tags=["Agent"],
@@ -578,3 +637,13 @@ async def get_chat_history(session_id: str):
     if not history:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
     return {"session_id": session_id, "history": history}
+
+@app.delete(
+    "/chat/{session_id}",
+    tags=["Agent"],
+    dependencies=[Depends(require_api_key)],
+    summary="Clear a chat session's conversation history",
+)
+async def clear_chat_session(session_id: str):
+    await clear_session(session_id)          # ← await
+    return {"message": f"Session '{session_id}' cleared."}

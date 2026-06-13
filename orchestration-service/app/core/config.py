@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     JAEGER_AGENT_HOST: str = "jaeger"
     JAEGER_AGENT_PORT: int = 6831
 
+    # MCP Tools Configuration
+    MCP_TOOLS_URL: str = "http://mcp-tools-service:8080"
+
     # API Key
     API_KEY: str = "changeme"
 
